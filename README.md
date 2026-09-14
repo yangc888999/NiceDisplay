@@ -1,6 +1,7 @@
 # NiceDisplay
 
-macOS 菜单栏外接显示器控制工具：**调节亮度 / 音量 / 分辨率，并让苹果妙控键盘的 F1/F2 真正能调外接屏亮度**。
+macOS 菜单栏外接显示器控制工具：**调节亮度 / 音量 / 分辨率，并键盘媒体键及F1 F2 F11 F12可以调节音量。
+界面参考betterdisplay，纯小白 Workbuddy 手搓，仅自测，放出源码，供其他小伙伴参考。
 
 A tiny macOS menu-bar utility for controlling external displays over DDC/CI — brightness, volume,
 resolution/HiDPI, main-display switching — plus real support for the Magic Keyboard's
