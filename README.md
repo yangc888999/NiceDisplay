@@ -27,8 +27,8 @@ brightness keys on external monitors.
 ## 编译
 
 ```bash
-git clone https://github.com/<your-name>/nicedisplay.git
-cd nicedisplay
+git clone https://github.com/yangc888999/NiceDisplay.git
+cd NiceDisplay
 bash build.sh
 ```
 
