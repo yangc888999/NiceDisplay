@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 注意：下面各 key 与其 string 之间不要放注释，否则签名工具会解析不到值。
+         bundle id 必须保持稳定：macOS 的「辅助功能」权限按 bundle id 绑定，
+         改 app 显示名(CFBundleName)即可，改 CFBundleIdentifier 会让已授权失效。 -->
+    <key>CFBundleName</key>
+    <string>NiceDisplay</string>
+    <key>CFBundleDisplayName</key>
+    <string>NiceDisplay</string>
+    <key>CFBundleIdentifier</key>
+    <string>pro.dlite.app</string>
+    <key>CFBundleExecutable</key>
+    <string>NiceDisplay</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>12</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>NiceDisplay — 自建轻量显示器控制</string>
+</dict>
+</plist>
