@@ -20,6 +20,15 @@ brightness keys on external monitors.
 - **内置命令行引擎 `dlite`**：所有功能都可通过 CLI 调用，方便脚本化
 - 纯本地、无网络请求、无第三方依赖，只用一个 Swift/ObjC 原生 App + C 引擎
 
+## 直接下载（不想自己编译）
+
+预编译安装包就在这个仓库里：**[dist/NiceDisplay-1.0.dmg](dist/NiceDisplay-1.0.dmg)**
+
+下载后打开 dmg，把 `NiceDisplay.app` 拖进「应用程序」即可。
+
+> ⚠️ 本 App 使用 **ad-hoc 签名、未做 Apple 公证**。从浏览器下载后首次打开可能被 Gatekeeper 拦，
+> 请 **右键点击 App → 打开**，或到 系统设置 → 隐私与安全性 点「仍要打开」。
+
 ## 系统要求
 
 - macOS 13 或更高（在 macOS 26 上开发测试）
