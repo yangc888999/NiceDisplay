@@ -5,11 +5,11 @@ mkicon
 dmg_stage/
 
 # 安装包
-#   根目录下的是 build.sh 的构建产物，不入库；
+#   根目录下的是 build.sh 的构建产物，不入库（全部 dmg / zip 都忽略）；
 #   dist/ 下的是正式发布包，需要入库（本机网络无法用 GitHub Release 附件通道，
 #   uploads.github.com 被拦，所以预编译包直接放进仓库分发）
-/NiceDisplay-1.0.dmg
-/dlite-1.0.dmg
+/*.dmg
+/*.zip
 
 # macOS 杂项
 .DS_Store

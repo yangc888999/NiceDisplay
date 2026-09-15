@@ -1261,6 +1261,53 @@ static int cmd_hidpi(CGDirectDisplayID did, const char *how, int revertSecs) {
     return rc == 0 ? 0 : 1;
 }
 
+// ---- 列出"当前分辨率 + HiDPI 组合"下可选的刷新率（降序，当前项带 current 前缀）----
+// 用 CGS 完整模式列表（CGDisplayCopyAllDisplayModes 在部分屏幕上拿不到全部模式）
+static void cmd_rates(CGDirectDisplayID did) {
+    int n = cgs_mode_count(did);
+    if (n < 0) { printf("本机不提供 CGS 模式 API\n"); return; }
+    int curNum = -1;
+    if (p_CGSGetCur) p_CGSGetCur(did, &curNum);
+
+    CGSDisplayMode cur; int haveCur = 0;
+    for (int i = 0; i < n; i++) {
+        CGSDisplayMode m;
+        if (cgs_read_mode(did, i, &m) != 0) continue;
+        if ((int)m.modeNumber == curNum) { cur = m; haveCur = 1; break; }
+    }
+    if (!haveCur) {
+        CGDisplayModeRef c = CGDisplayCopyDisplayMode(did);
+        if (!c) { printf("无法确定当前模式\n"); return; }
+        memset(&cur, 0, sizeof cur);
+        cur.width = (unsigned)CGDisplayModeGetWidth(c);
+        cur.height = (unsigned)CGDisplayModeGetHeight(c);
+        cur.freq = (unsigned)CGDisplayModeGetRefreshRate(c);
+        CFRelease(c);
+    }
+    int hd = cgs_mode_is_hidpi(&cur);
+
+    double rates[64]; int rn = 0;
+    for (int i = 0; i < n; i++) {
+        CGSDisplayMode m;
+        if (cgs_read_mode(did, i, &m) != 0) continue;
+        if (m.width != cur.width || m.height != cur.height) continue;
+        if (cgs_mode_is_hidpi(&m) != hd) continue;
+        double hz = m.freq;
+        if (hz <= 0) continue;
+        int dup = 0;
+        for (int k = 0; k < rn; k++) if (fabs(rates[k] - hz) < 0.5) { dup = 1; break; }
+        if (!dup && rn < 64) rates[rn++] = hz;
+    }
+    for (int i = 0; i < rn; i++)
+        for (int j = i + 1; j < rn; j++)
+            if (rates[j] > rates[i]) { double t = rates[i]; rates[i] = rates[j]; rates[j] = t; }
+
+    printf("mode %ux%u %s current=%.0fHz\n", cur.width, cur.height,
+           hd ? "HiDPI" : "LoDPI", (double)cur.freq);
+    for (int i = 0; i < rn; i++)
+        printf("%s%.0fHz\n", fabs(rates[i] - cur.freq) < 0.5 ? "current " : "", rates[i]);
+}
+
 static int cmd_mode(CGDirectDisplayID did, const char *spec, int revertSecs) {
     ModeSpec sp;
     if (parse_mode_spec(spec, &sp) != 0) { fprintf(stderr, "模式规格无法解析: %s\n", spec); return 2; }
@@ -1478,6 +1525,7 @@ int main(int argc, char **argv) {
             "  dlite enable  <id|uuid>\n"
             "  dlite restore\n"
             "  dlite modes <id|uuid> [--all]\n"
+            "  dlite rates <id|uuid>            # 当前分辨率+HiDPI 下可选的刷新率（降序）\n"
             "  dlite mode  <id|uuid> <1920x1080[@60][:hidpi|:lodpi]> [--revert N]\n"
             "  dlite hidpi <id|uuid> on|off|toggle\n"
             "  dlite main  <id|uuid>\n"
@@ -1640,6 +1688,14 @@ int main(int argc, char **argv) {
         int mAll = 0;
         for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--all")) mAll = 1;
         cmd_modes(did, mAll);
+        return 0;
+    }
+
+    if (!strcmp(argv[1], "rates")) {
+        if (argc < 3) { fprintf(stderr, "用法: dlite rates <id|uuid>\n"); return 2; }
+        CGDirectDisplayID did;
+        if (resolve_target(argv[2], &did) != 0) { fprintf(stderr, "找不到显示器 %s\n", argv[2]); return 1; }
+        cmd_rates(did);
         return 0;
     }
 

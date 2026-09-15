@@ -53,7 +53,8 @@ static NSDictionary *DefaultConf(void) {
         // 菜单只显示亮度与音量，其余控制项默认隐藏
         @"showBrightness": @"1",
         @"showVolume": @"1",
-        @"showResolution": @"0",
+        @"showResolution": @"1",
+        @"showRate": @"1",
         @"showHiDPI": @"0",
         @"showMain": @"0",
         @"showConnected": @"0",
@@ -115,7 +116,7 @@ static void SaveConf(void) {
     [s appendFormat:@"mode1Spec=%@\n", gConf[@"mode1Spec"]];
     [s appendFormat:@"mode2Spec=%@\n", gConf[@"mode2Spec"]];
     [s appendString:@"\n# ---- 菜单里显示哪些项（1 显示 / 0 隐藏）----\n"];
-    for (NSString *k in @[@"showBrightness", @"showVolume", @"showResolution", @"showHiDPI", @"showMain", @"showConnected", @"showOSD"])
+    for (NSString *k in @[@"showBrightness", @"showVolume", @"showResolution", @"showRate", @"showHiDPI", @"showMain", @"showConnected", @"showOSD"])
         [s appendFormat:@"%@=%@\n", k, gConf[k]];
     [s appendString:@"\n# ---- 原生键盘亮度/音量键（妙控键盘 Fn+F1/F2/F10/F11/F12）----\n"];
     [s appendString:@"# mediaKeys=1 接管；0 不接管（交给系统）\n"];
@@ -1398,6 +1399,10 @@ static const CGFloat kOSD_H = 44;
 
 #pragma mark - 菜单
 
+// 版本号（与 Info.plist 的 CFBundleShortVersionString 保持一致）
+#define APP_VERSION   @"1.1"
+#define APP_AUTHOR    @"@yangc888999"
+
 - (void)menuWillOpen:(NSMenu *)menu { self.menuIsOpen = YES; }
 - (void)menuDidClose:(NSMenu *)menu { self.menuIsOpen = NO; }
 
@@ -1445,6 +1450,12 @@ static const CGFloat kOSD_H = 44;
             it.submenu = [self resolutionMenuFor:d];
             [menu addItem:it];
         }
+        if ([gConf[@"showRate"] boolValue]) {
+            NSMenuItem *rt = [[NSMenuItem alloc] initWithTitle:@"刷新率" action:nil keyEquivalent:@""];
+            rt.image = [self symImage:@"speedometer"];
+            rt.submenu = [self ratesMenuFor:d];
+            [menu addItem:rt];
+        }
         if ([gConf[@"showHiDPI"] boolValue]) {
             NSMenuItem *hi = [self checkItem:@"高分辨率 (HiDPI)" on:d.modeHiDPI action:@selector(onToggleHiDPI:) obj:@(d.did)];
             hi.image = [self symImage:@"textformat.size"];
@@ -1479,7 +1490,12 @@ static const CGFloat kOSD_H = 44;
     setIt.image = [self symImage:@"gearshape"];
     [menu addItem:setIt];
     [menu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem *quitIt = [self plainItem:@"退出 NiceDisplay" action:@selector(onQuit:)];
+    // 版本信息（不可点）
+    NSMenuItem *ver = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"NiceDisplay v%@ · @yangc888999", APP_VERSION]
+                                                action:nil keyEquivalent:@""];
+    ver.enabled = NO;
+    [menu addItem:ver];
+    NSMenuItem *quitIt = [self plainItem:@"退出" action:@selector(onQuit:)];
     quitIt.image = [self symImage:@"power"];
     [menu addItem:quitIt];
 }
@@ -1609,6 +1625,31 @@ static const CGFloat kOSD_H = 44;
     return it;
 }
 
+// 刷新率子菜单：列出"当前分辨率 + HiDPI"下该屏支持的所有刷新率（降序，最高在最上面，当前项打勾）
+- (NSMenu *)ratesMenuFor:(DlDisp *)d {
+    NSMenu *m = [[NSMenu alloc] init];
+    NSString *out = RunCLI(@[@"rates", [NSString stringWithFormat:@"%d", d.did]]);
+    for (NSString *raw in [out componentsSeparatedByString:@"\n"]) {
+        NSString *line = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (line.length == 0) continue;
+        if ([line hasPrefix:@"mode "]) continue;          // 首行是当前模式描述，跳过
+        BOOL isCur = [line hasPrefix:@"current "];
+        NSString *hzStr = isCur ? [line substringFromIndex:8] : line;   // "144Hz"
+        NSString *hzNum = [hzStr stringByReplacingOccurrencesOfString:@"Hz" withString:@""];
+        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:hzStr action:@selector(onPickRate:) keyEquivalent:@""];
+        it.target = self;
+        it.representedObject = @[[NSString stringWithFormat:@"%d", d.did], hzNum];
+        it.state = isCur ? NSControlStateValueOn : NSControlStateValueOff;
+        [m addItem:it];
+    }
+    if (m.numberOfItems == 0) {
+        NSMenuItem *e = [[NSMenuItem alloc] initWithTitle:@"（该分辨率下只有一种刷新率）" action:nil keyEquivalent:@""];
+        e.enabled = NO;
+        [m addItem:e];
+    }
+    return m;
+}
+
 - (NSMenu *)resolutionMenuFor:(DlDisp *)d {
     NSMenu *m = [[NSMenu alloc] init];
     NSString *out = RunCLI(@[@"presets", [NSString stringWithFormat:@"%d", d.did]]);
@@ -1707,6 +1748,20 @@ static const CGFloat kOSD_H = 44;
     }
     NDLog(@"[mode] 切换 id=%d HiDPI=%d → %@", did, wantHiDPI, spec);
     RunCLIAsync(@[@"mode", [NSString stringWithFormat:@"%d", did], spec], ^(NSString *o) { [self refreshAsync]; });
+}
+
+// 切换刷新率：保持当前分辨率与 HiDPI 组合，只改刷新率
+- (void)onPickRate:(NSMenuItem *)it {
+    NSArray *a = it.representedObject;
+    if (a.count < 2) return;
+    NSString *did = a[0];
+    NSString *hz  = a[1];
+    DlDisp *d = [self dispByID:did.intValue];
+    if (!d) return;
+    NSString *spec = [NSString stringWithFormat:@"%dx%d@%@:%@",
+                      d.modeW, d.modeH, hz, d.modeHiDPI ? @"hidpi" : @"lodpi"];
+    NDLog(@"[rate] 切换 id=%@ → %@", did, spec);
+    RunCLIAsync(@[@"mode", did, spec], ^(NSString *o) { [self refreshAsync]; });
 }
 
 - (void)onSetMain:(NSMenuItem *)it {
@@ -1960,16 +2015,11 @@ static const CGFloat kOSD_H = 44;
     self.brightMouseCheck.state = [gConf[@"brightnessTarget"] isEqualToString:@"mouse"] ? NSControlStateValueOn : NSControlStateValueOff;
     [v1 addSubview:self.brightMouseCheck];
 
-    NSButton *b1 = [NSButton buttonWithTitle:@"保存当前布局快照" target:self action:@selector(onLayoutSave:)];
-    b1.frame = NSMakeRect(20, 122, 170, 26);
-    [v1 addSubview:b1];
-    NSButton *b2 = [NSButton buttonWithTitle:@"按快照还原布局" target:self action:@selector(onLayoutRestore:)];
-    b2.frame = NSMakeRect(200, 122, 170, 26);
-    [v1 addSubview:b2];
-    NSButton *b3 = [NSButton buttonWithTitle:@"应急：连回所有显示器" target:self action:@selector(onRestoreAll:)];
-    b3.frame = NSMakeRect(20, 82, 200, 26);
-    [v1 addSubview:b3];
-    [v1 addSubview:[self label:@"提示：亮度/音量之外的项默认已隐藏，可在「菜单显示项」里打开。" frame:NSMakeRect(20, 48, 500, 18) bold:NO]];
+    // 布局快照 / 应急恢复 已移到「高级」页（用户要求常规页保持简洁）
+    [v1 addSubview:[self label:@"更多设置见「高级」页；菜单显示项可在「菜单显示项」页调整。"
+                        frame:NSMakeRect(20, 122, 500, 18) bold:NO]];
+    [v1 addSubview:[self label:[NSString stringWithFormat:@"NiceDisplay v%@ · 开发者 %@", APP_VERSION, APP_AUTHOR]
+                        frame:NSMakeRect(20, 60, 500, 18) bold:NO]];
     t1.view = v1;
     [tv addTabViewItem:t1];
 
@@ -1978,8 +2028,8 @@ static const CGFloat kOSD_H = 44;
     t2.label = @"菜单显示项";
     NSView *v2 = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, 400)];
     [v2 addSubview:[self label:@"勾选要在菜单里出现的控制项" frame:NSMakeRect(20, 358, 300, 18) bold:YES]];
-    NSArray *showKeys = @[@"showBrightness", @"showVolume", @"showResolution", @"showHiDPI", @"showOSD"];
-    NSArray *showTitles = @[@"亮度滑块", @"音量滑块", @"分辨率子菜单", @"高分辨率 (HiDPI)", @"调节动画 OSD 浮层（异常可关）"];
+    NSArray *showKeys = @[@"showBrightness", @"showVolume", @"showResolution", @"showRate", @"showHiDPI", @"showOSD"];
+    NSArray *showTitles = @[@"亮度滑块", @"音量滑块", @"分辨率子菜单", @"刷新率子菜单", @"高分辨率 (HiDPI)", @"调节动画 OSD 浮层（异常可关）"];
     for (NSUInteger i = 0; i < showKeys.count; i++) {
         NSButton *c = [NSButton checkboxWithTitle:showTitles[i] target:nil action:nil];
         c.frame = NSMakeRect(20, 320 - (NSInteger)i * 30, 300, 22);
@@ -2021,10 +2071,19 @@ static const CGFloat kOSD_H = 44;
     [v4 addSubview:[self label:@"本机 Apple Silicon 较新版 macOS 未导出私有旋转接口，工具内无法旋转。" frame:NSMakeRect(20, 218, 500, 18) bold:NO]];
     [v4 addSubview:[self label:@"请到 系统设置 → 显示器 → 旋转 里手动调整。" frame:NSMakeRect(20, 200, 500, 18) bold:NO]];
 
-    [v4 addSubview:[self label:@"应急恢复" frame:NSMakeRect(20, 156, 200, 18) bold:YES]];
-    NSButton *bRestore = [NSButton buttonWithTitle:@"连回所有显示器" target:self action:@selector(onRestoreAll:)];
-    bRestore.frame = NSMakeRect(20, 122, 160, 26);
+    // ---- 布局快照 / 应急恢复（从「常规」页移过来，用户要求常规页保持简洁）----
+    [v4 addSubview:[self label:@"布局快照" frame:NSMakeRect(20, 158, 200, 18) bold:YES]];
+    NSButton *bSnap = [NSButton buttonWithTitle:@"保存当前布局快照" target:self action:@selector(onLayoutSave:)];
+    bSnap.frame = NSMakeRect(20, 124, 170, 26);
+    [v4 addSubview:bSnap];
+    NSButton *bRestore = [NSButton buttonWithTitle:@"按快照还原布局" target:self action:@selector(onLayoutRestore:)];
+    bRestore.frame = NSMakeRect(200, 124, 170, 26);
     [v4 addSubview:bRestore];
+
+    [v4 addSubview:[self label:@"应急恢复" frame:NSMakeRect(20, 86, 200, 18) bold:YES]];
+    NSButton *bAll = [NSButton buttonWithTitle:@"连回所有显示器" target:self action:@selector(onRestoreAll:)];
+    bAll.frame = NSMakeRect(20, 52, 160, 26);
+    [v4 addSubview:bAll];
 
     t4.view = v4;
     [tv addTabViewItem:t4];

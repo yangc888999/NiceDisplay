@@ -17,13 +17,14 @@ brightness keys on external monitors.
 - **右上角长条 OSD**：仿系统原生样式的细长进度提示，只有进度条变化、不闪烁
 - **每块显示器一行管理**：标题行 + 右侧开关（开 = 连接，关 = 熄屏断开）
 - **分辨率 / HiDPI 一键切换**：勾选 HiDPI 自动选该屏支持的最高 HiDPI 分辨率，取消则回到最高普通分辨率
+- **刷新率切换**：列出当前分辨率下该屏支持的**所有刷新率**（降序排列，默认取最高），一键切换
 - **设为主屏幕、布局快照 / 一键还原、应急连回所有显示器**
 - **内置命令行引擎 `dlite`**：所有功能都可通过 CLI 调用，方便脚本化
 - 纯本地、无网络请求、无第三方依赖，只用一个 Swift/ObjC 原生 App + C 引擎
 
 ## 直接下载（不想自己编译）
 
-预编译安装包就在这个仓库里：**[dist/NiceDisplay-1.0.dmg](dist/NiceDisplay-1.0.dmg)**
+预编译安装包就在这个仓库里：**[dist/NiceDisplay-1.1.dmg](dist/NiceDisplay-1.1.dmg)**（历史版本见 `dist/` 目录）
 
 下载后打开 dmg，把 `NiceDisplay.app` 拖进「应用程序」即可。
 
@@ -114,6 +115,7 @@ $DLITE ddc bump <id|uuid> 0x10 -5 # 相对增减
 $DLITE mute     <id|uuid>         # 静音
 $DLITE mode     <id|uuid> 1920x1080@60:hidpi   # 切换分辨率（可带刷新率与 HiDPI）
 $DLITE presets  <id|uuid>         # 该屏的可用"标准分辨率"白名单
+$DLITE rates    <id|uuid>         # 当前分辨率+HiDPI 下可选的刷新率（降序，当前项标 current）
 $DLITE hidpi    <id|uuid> on|off|toggle
 $DLITE main     <id|uuid>         # 设为主屏
 $DLITE arrange  <id|uuid> left|right|top|bottom   # 摆到主屏的指定方向
