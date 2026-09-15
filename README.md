@@ -24,7 +24,7 @@ brightness keys on external monitors.
 
 ## 直接下载（不想自己编译）
 
-预编译安装包就在这个仓库里：**[dist/NiceDisplay-1.1.dmg](dist/NiceDisplay-1.1.dmg)**（历史版本见 `dist/` 目录）
+预编译安装包就在这个仓库里：**[dist/NiceDisplay-1.2.dmg](dist/NiceDisplay-1.2.dmg)**（历史版本见 `dist/` 目录）
 
 下载后打开 dmg，把 `NiceDisplay.app` 拖进「应用程序」即可。
 
@@ -133,6 +133,12 @@ $DLITE layout save|restore|show   # 布局快照
 - **键盘接管**：`CGEventTapCreate` 挂在 **HID 层**（`kCGHIDEventTap`）而非 session 层，
   这样能在系统亮度服务消费之前拿到事件；同时监听标准功能键码与系统媒体事件
   （媒体编号 `0/1/7` = 音量增/减/静音）
+- **能力全部动态探测**，不含任何针对特定型号的硬编码：
+  - 分辨率档位：常用档位表 + 按显示器自身宽高比动态兜底（超宽屏 / 5K / 竖屏旋转都适配）
+  - 刷新率：从该屏实际的模式列表中按"当前分辨率 + HiDPI 组合"筛选
+  - 音量键作用屏：按当前音频输出设备名匹配；匹配不到退回主屏
+  - 亮度跟随鼠标：按 `NSScreen` 命中位置映射显示器
+  - DDC / 旋转能力：运行时探测（私有接口未导出时自动降级并提示）
 - **回调必须立刻返回**：tap 回调里禁止建窗口 / 跑动画 / 做文件 I/O，
   所有 UI 一律 `dispatch_async` 到主线程，否则回调超时会被系统 `disable`，键盘监听整体失效
 - **枚举显示器时**：`CGDisplayBounds` 原点在左下角；`CGDirectDisplayID` 会变化，持久化要认 UUID

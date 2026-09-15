@@ -1400,8 +1400,8 @@ static const CGFloat kOSD_H = 44;
 #pragma mark - 菜单
 
 // 版本号（与 Info.plist 的 CFBundleShortVersionString 保持一致）
-#define APP_VERSION   @"1.1"
-#define APP_AUTHOR    @"@yangc888999"
+#define APP_VERSION   @"1.2"
+#define APP_AUTHOR    @"@yangc8899"
 
 - (void)menuWillOpen:(NSMenu *)menu { self.menuIsOpen = YES; }
 - (void)menuDidClose:(NSMenu *)menu { self.menuIsOpen = NO; }
@@ -1490,11 +1490,7 @@ static const CGFloat kOSD_H = 44;
     setIt.image = [self symImage:@"gearshape"];
     [menu addItem:setIt];
     [menu addItem:[NSMenuItem separatorItem]];
-    // 版本信息（不可点）
-    NSMenuItem *ver = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"NiceDisplay v%@ · @yangc888999", APP_VERSION]
-                                                action:nil keyEquivalent:@""];
-    ver.enabled = NO;
-    [menu addItem:ver];
+    // 版本信息只在「设置 → 常规」页显示，菜单里不显示（用户要求：菜单保持干净）
     NSMenuItem *quitIt = [self plainItem:@"退出" action:@selector(onQuit:)];
     quitIt.image = [self symImage:@"power"];
     [menu addItem:quitIt];
@@ -2018,7 +2014,7 @@ static const CGFloat kOSD_H = 44;
     // 布局快照 / 应急恢复 已移到「高级」页（用户要求常规页保持简洁）
     [v1 addSubview:[self label:@"更多设置见「高级」页；菜单显示项可在「菜单显示项」页调整。"
                         frame:NSMakeRect(20, 122, 500, 18) bold:NO]];
-    [v1 addSubview:[self label:[NSString stringWithFormat:@"NiceDisplay v%@ · 开发者 %@", APP_VERSION, APP_AUTHOR]
+    [v1 addSubview:[self label:[NSString stringWithFormat:@"当前版本 v%@ · 开发者 %@", APP_VERSION, APP_AUTHOR]
                         frame:NSMakeRect(20, 60, 500, 18) bold:NO]];
     t1.view = v1;
     [tv addTabViewItem:t1];

@@ -757,15 +757,20 @@ static void cmd_info(void) {
     }
 }
 
-// 面向菜单的"标准分辨率"列表：预设白名单 ∩ 实际可用模式（用私有列表，状态无关、最完整），
-// 再补上当前模式。避免把 32 像素一档的缩放阶梯（214 条里绝大多数）塞进菜单。
-static const char *kPresets[] = {
-    "3840x2160", "3200x1800", "2880x1620", "2560x1440", "2304x1296", "2048x1152",
-    "1920x1200", "1920x1080", "1680x1050", "1600x900", "1440x900", "1440x810",
-    "1280x800", "1280x720", "1152x864", "1024x768", "800x600", NULL
-};
+// 分辨率档位改为「动态探测面板原生像素」（见 cmd_presets），不再使用硬编码白名单
 
 typedef struct { int w, h, hidpi; unsigned hz; } PresetEnt;
+
+// 面向菜单的"常用分辨率"档位（覆盖常见面板：16:9 / 16:10 / 3:2 / 21:9 / 32:9 / 5K 等）。
+// 注意：这只是"精选"，不是唯一来源 —— cmd_presets 命中不足时会**动态兜底**，
+// 按该显示器自身的宽高比筛选实际档位，所以超宽屏 / 5K / 竖屏旋转等其他设备也能正常列出。
+static const char *kPresets[] = {
+    "5120x2880", "5120x2160", "5120x1440", "4096x2304", "3840x2160", "3840x1600", "3840x1080",
+    "3440x1440", "3200x1800", "3008x1692", "2880x1800", "2880x1620", "2560x1600", "2560x1440",
+    "2560x1080", "2304x1440", "2304x1296", "2048x1152", "1920x1200", "1920x1080", "1680x1050",
+    "1600x900", "1440x900", "1440x810", "1280x800", "1280x720", "1152x864", "1024x768", "800x600",
+    NULL
+};
 
 static void cmd_presets(CGDirectDisplayID did) {
     int n = cgs_mode_count(did);
@@ -777,26 +782,65 @@ static void cmd_presets(CGDirectDisplayID did) {
     PresetEnt current = {0, 0, 0, 0};
     int haveCurrent = 0;
 
+    // —— 动态探测（不依赖任何硬编码白名单，任何显示器都适用）——
+    // 第一遍先找到"当前模式"，以其宽高比 + 尺寸作为基准；第二遍据此筛选档位。
+    // 这样超宽屏(21:9/32:9)、5K、竖屏旋转都能自然适配，且不会混入反方向的档位。
+    CGSDisplayMode curM; int haveCurM = 0;
     for (int i = 0; i < n; i++) {
         CGSDisplayMode m;
         if (cgs_read_mode(did, i, &m) != 0) continue;
-        int hd = cgs_mode_is_hidpi(&m);
-        // 记录当前模式
-        if ((int)m.modeNumber == curNum) { current.w = m.width; current.h = m.height; current.hidpi = hd; current.hz = m.freq; haveCurrent = 1; }
-        // 是否属于预设白名单（竖屏时同时接受转置匹配）
-        char key[32], tkey[32];
-        snprintf(key, sizeof key, "%ux%u", m.width, m.height);
-        snprintf(tkey, sizeof tkey, "%ux%u", m.height, m.width);
-        int ok = 0;
-        for (int k = 0; kPresets[k]; k++)
-            if (!strcmp(kPresets[k], key) || !strcmp(kPresets[k], tkey)) { ok = 1; break; }
-        if (!ok) continue;
+        if ((int)m.modeNumber == curNum) { curM = m; haveCurM = 1; break; }
+    }
+    double arRef = (haveCurM && curM.height) ? (double)curM.width / (double)curM.height : 0.0;
+    int minAxis = haveCurM ? (int)(curM.width * 4 / 10) : 0;   // 太小的档位没意义，滤掉
+
+    // 两遍收集：第一遍用"常用档位"精选（列表干净）；若一个都没命中（少见面板，
+    // 例如 21:9 超宽屏、5K、方形屏），第二遍按该屏自身宽高比动态兜底，保证不空。
+    for (int pass = 0; pass < 2 && en == 0; pass++) {
+        for (int i = 0; i < n; i++) {
+            CGSDisplayMode m;
+            if (cgs_read_mode(did, i, &m) != 0) continue;
+            int hd = cgs_mode_is_hidpi(&m);
+            // 记录当前模式
+            if ((int)m.modeNumber == curNum) { current.w = m.width; current.h = m.height; current.hidpi = hd; current.hz = m.freq; haveCurrent = 1; }
+
+            int ok = 0;
+            if (pass == 0) {
+                // 常用档位白名单（竖屏时同时接受转置匹配）
+                char key[32], tkey[32];
+                snprintf(key, sizeof key, "%ux%u", m.width, m.height);
+                snprintf(tkey, sizeof tkey, "%ux%u", m.height, m.width);
+                for (int k = 0; kPresets[k]; k++)
+                    if (!strcmp(kPresets[k], key) || !strcmp(kPresets[k], tkey)) { ok = 1; break; }
+            } else {
+                // 兜底：与当前模式同宽高比、尺寸不太小的档位
+                ok = 1;
+                if (arRef > 0) {
+                    double ar = (double)m.width / (double)m.height;
+                    if (fabs(ar - arRef) / arRef > 0.02) ok = 0;
+                    if ((int)m.width < minAxis) ok = 0;
+                }
+            }
+            if (!ok) continue;
+
+            int idx = -1;
+            for (int k = 0; k < en; k++)
+                if (ent[k].w == (int)m.width && ent[k].h == (int)m.height && ent[k].hidpi == hd) { idx = k; break; }
+            if (idx < 0) {
+                ent[en].w = m.width; ent[en].h = m.height; ent[en].hidpi = hd; ent[en].hz = m.freq; en++;
+            } else if (m.freq > ent[idx].hz) ent[idx].hz = m.freq;
+        }
+    }
+
+    // 保证当前模式一定在列表里（否则切到当前档会"找不到"）
+    if (haveCurrent) {
         int idx = -1;
         for (int k = 0; k < en; k++)
-            if (ent[k].w == (int)m.width && ent[k].h == (int)m.height && ent[k].hidpi == hd) { idx = k; break; }
+            if (ent[k].w == current.w && ent[k].h == current.h && ent[k].hidpi == current.hidpi) { idx = k; break; }
         if (idx < 0) {
-            ent[en].w = m.width; ent[en].h = m.height; ent[en].hidpi = hd; ent[en].hz = m.freq; en++;
-        } else if (m.freq > ent[idx].hz) ent[idx].hz = m.freq;
+            ent[en].w = current.w; ent[en].h = current.h; ent[en].hidpi = current.hidpi; ent[en].hz = current.hz;
+            en++;
+        } else if (current.hz > ent[idx].hz) ent[idx].hz = current.hz;
     }
 
     if (haveCurrent)
@@ -808,6 +852,10 @@ static void cmd_presets(CGDirectDisplayID did) {
             if ((long)ent[j].w * ent[j].h > (long)ent[i].w * ent[i].h) {
                 PresetEnt t = ent[i]; ent[i] = ent[j]; ent[j] = t;
             }
+
+    // 兜底模式可能命中上百个 32px 阶梯档位 → 只保留尺寸最大的若干个，保持菜单清爽
+    if (en > 12) en = 12;
+
     for (int i = 0; i < en; i++)
         printf("%dx%d %s %uHz\n", ent[i].w, ent[i].h, ent[i].hidpi ? "HiDPI" : "LoDPI", ent[i].hz);
 

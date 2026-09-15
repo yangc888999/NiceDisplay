@@ -42,7 +42,7 @@ codesign --force --sign - "$APP/Contents/MacOS/dlite" >/dev/null 2>&1 || true
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
 
 # ---- 打包 DMG（拖拽式安装盘：app + 安装说明 + 「应用程序」快捷方式）----
-DMG="NiceDisplay-1.1.dmg"
+DMG="NiceDisplay-1.2.dmg"
 echo "==> 打包 $DMG"
 mkdir -p dmg_stage
 cp -R "$APP" dmg_stage/
