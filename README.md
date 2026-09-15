@@ -2,7 +2,7 @@
 
 macOS 菜单栏外接显示器控制工具：**调节亮度 / 音量 / 分辨率，接管键盘的 F1/F2（亮度）与 F10/F11/F12（静音 / 音量）**。
 
-界面参考 BetterDisplay；纯小白用 Workbuddy 手搓，仅自测，放出源码供其他小伙伴参考。
+界面参考 BetterDisplay；纯小白用 Workbuddy 手搓，仅通过自测。放出源码供其他小伙伴参考,**不对任何使用过程中出现的任何问题负责，请谨慎安装使用**。
 
 A tiny macOS menu-bar utility for controlling external displays over DDC/CI — brightness, volume,
 resolution/HiDPI, main-display switching — plus real support for the Magic Keyboard's
