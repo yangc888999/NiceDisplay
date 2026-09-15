@@ -64,6 +64,8 @@ static NSDictionary *DefaultConf(void) {
         @"lastSecondaryID": @"0",
         // 接管妙控键盘原生亮度/音量键
         @"mediaKeys": @"1",
+        // F7/F8/F9 直按控制播放（在 tap 里把标准键码转发成系统媒体事件）；关闭则原样放行
+        @"fnPlaybackKeys": @"1",
         @"mediaVolumeTarget": @"audio",
         // 亮度键作用屏：main=主屏（默认，与旧版行为一致） mouse=鼠标所在屏 或直接填显示器 id
         @"brightnessTarget": @"main",
@@ -116,7 +118,7 @@ static void SaveConf(void) {
     [s appendFormat:@"mode1Spec=%@\n", gConf[@"mode1Spec"]];
     [s appendFormat:@"mode2Spec=%@\n", gConf[@"mode2Spec"]];
     [s appendString:@"\n# ---- 菜单里显示哪些项（1 显示 / 0 隐藏）----\n"];
-    for (NSString *k in @[@"showBrightness", @"showVolume", @"showResolution", @"showRate", @"showHiDPI", @"showMain", @"showConnected", @"showOSD"])
+    for (NSString *k in @[@"showBrightness", @"showVolume", @"showResolution", @"showRate", @"showHiDPI", @"showMain", @"showConnected", @"showOSD", @"fnPlaybackKeys"])
         [s appendFormat:@"%@=%@\n", k, gConf[k]];
     [s appendString:@"\n# ---- 原生键盘亮度/音量键（妙控键盘 Fn+F1/F2/F10/F11/F12）----\n"];
     [s appendString:@"# mediaKeys=1 接管；0 不接管（交给系统）\n"];
@@ -261,6 +263,10 @@ enum {
     NX_KEYTYPE_BRIGHTNESS_UP = 2,
     NX_KEYTYPE_BRIGHTNESS_DOWN = 3,
     NX_KEYTYPE_MUTE = 7,
+    // 播放控制（F7/F8/F9 转发用；这三种事件我们不接管，直接交给系统）
+    NX_KEYTYPE_PLAY = 16,
+    NX_KEYTYPE_NEXT = 17,
+    NX_KEYTYPE_PREVIOUS = 18,
 };
 #define NX_SUBTYPE_AUX_CONTROL_BUTTONS 8
 
@@ -541,6 +547,24 @@ static void NDLog(NSString *fmt, ...) {
     [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile];
 }
 
+// 合成一个系统媒体键事件并投递到 HID 层（让系统/播放器当作真按了媒体键处理）
+// 用途：把 F7/F8/F9 的标准键码转发成"上一曲 / 播放暂停 / 下一曲"，
+// 这样即使用户把 F 键设成了标准功能键，播放控制也不必按 Fn。
+static void ndPostMediaKey(int nxKey, BOOL down) {
+    long data1 = ((long)nxKey << 16) | (down ? 0x0A00 : 0x0B00);
+    NSEvent *e = [NSEvent otherEventWithType:NSEventTypeSystemDefined
+                                    location:NSZeroPoint
+                               modifierFlags:0
+                                   timestamp:0
+                                windowNumber:0
+                                     context:nil
+                                     subtype:NX_SUBTYPE_AUX_CONTROL_BUTTONS
+                                       data1:data1
+                                       data2:-1];
+    CGEventRef cg = e.CGEvent;
+    if (cg) CGEventPost(kCGHIDEventTap, cg);
+}
+
 // CGEventTap 回调：在系统层捕获媒体键（NSEvent addGlobalMonitor 收不到硬件媒体键，必须用 tap）
 // 同时兼收"普通 F1/F2 按键"——妙控键盘在"F 键当标准功能键"模式下直接按 F1/F2
 // 既不发媒体事件、Carbon 热键也收不到，只能在这里抓普通 keycode。
@@ -552,11 +576,35 @@ static CGEventRef mediaTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     }
     AppDelegate *ad = (__bridge AppDelegate *)info;
 
-    // ---- 普通 F 键（F1/F2 亮度、F10 静音、F11/F12 音量）----
-    // 系统把"F1~F12 用作标准功能键"打开时，直按这些键发的是标准键码（不是媒体事件），
-    // 系统亮度服务与 Carbon 热键都可能先一步吃掉它 —— 只能在 HID 层拦。
+    // ---- 普通 F 键 ----
+    // F1/F2 亮度、F10 静音、F11/F12 音量：由本工具接管（走 DDC）
+    // F7/F8/F9（上一曲 / 播放暂停 / 下一曲）：**转发成系统媒体事件**，让系统去控制播放器。
+    //   为什么需要：切到"F 键当标准功能键"后，直按 F7~F9 不再发媒体事件，播放控制会失效；
+    //   在这里重新合成媒体事件投递出去，等于"替键盘补发"，用户就不必按 Fn 了。
     if (type == kCGEventKeyDown || type == kCGEventKeyUp) {
         int64_t kc = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        CGEventFlags fl = CGEventGetFlags(event);
+        CGEventFlags bad = kCGEventFlagMaskCommand | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate;
+        BOOL plain = !(fl & bad);
+        BOOL down = (type == kCGEventKeyDown);
+
+        // F7=上一曲 / F8=播放暂停 / F9=下一曲 → 合成媒体键事件
+        int mediaKey = -1;
+        if (plain) {
+            if (kc == 98)       mediaKey = NX_KEYTYPE_PREVIOUS;   // F7
+            else if (kc == 100) mediaKey = NX_KEYTYPE_PLAY;       // F8
+            else if (kc == 101) mediaKey = NX_KEYTYPE_NEXT;       // F9
+        }
+        if (mediaKey != -1) {
+            if (![gConf[@"fnPlaybackKeys"] boolValue]) return event;   // 选项关闭：原样放行给前端应用
+            ndPostMediaKey(mediaKey, down);
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+                NDLog(@"[tap] F%lld → 转发媒体键 code=%d down=%d", (long long)(kc == 98 ? 7 : kc == 100 ? 8 : 9),
+                      mediaKey, down);
+            });
+            return NULL;   // 消费原始按键，避免 App 收到 F7~F9
+        }
+
         int act = -1;
         switch (kc) {
             case 122: act = ActBrightDown; break;   // F1
@@ -567,10 +615,8 @@ static CGEventRef mediaTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
             default: act = -1;
         }
         if (act != -1) {
-            CGEventFlags fl = CGEventGetFlags(event);
-            CGEventFlags bad = kCGEventFlagMaskCommand | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate;
-            if (!(fl & bad)) {
-                if (type == kCGEventKeyDown) {
+            if (plain) {
+                if (down) {
                     dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
                         NDLog(@"[tap] F 键 keycode=%lld → act=%d", kc, act);
                     });
@@ -971,6 +1017,7 @@ static const CGFloat kOSD_H = 44;
     // 左侧图标（亮度=太阳 / 音量=喇叭）
     NSImageView *icon = [[NSImageView alloc] initWithFrame:NSMakeRect(14, (H - 18) / 2.0, 18, 18)];
     icon.imageScaling = NSImageScaleProportionallyUpOrDown;
+    icon.contentTintColor = [NSColor whiteColor];   // HUD 浮层上固定白色
     [cv addSubview:icon];
     self.osdIcon = icon;
 
@@ -1116,7 +1163,8 @@ static const CGFloat kOSD_H = 44;
         [self refreshAsync];          // 走正常刷新路径再取一次（DDC 回读偶发失败，多试一次）
         pumpRunLoop(1.5);             // 等它回来，让自检基准与真实运行一致
         DlDisp *vd = [self volumeTargetDisp];
-        DlDisp *md = [self mainDisp];
+        // 【注意】亮度要用"实际作用屏"（可能跟随鼠标），否则自检会读错屏而误报"无变化"
+        DlDisp *md = [self brightnessTargetDisp] ?: [self mainDisp];
         printf("媒体键链路自检（注意：本自检用合成事件只验证\"动作逻辑\"，不验证真实抓取）\n");
         printf("  默认音频输出设备 = %s\n", self.audioDeviceName.UTF8String ?: "(空)");
         printf("  亮度键作用屏幕   = %s (id=%d)\n", md ? [md displayName].UTF8String : "(无)", md ? md.did : -1);
@@ -1172,6 +1220,16 @@ static const CGFloat kOSD_H = 44;
         printf("  媒体键监听器 = %s%s\n", self.mediaTap ? "CGEventTap 已安装" : "未安装",
                self.mediaUnauthorized ? "（缺辅助功能权限）" : "");
         printf("BetterDisplay 运行中 = %s\n", self.betterDisplayRunning ? "是" : "否");
+        {
+            // F7~F9 转发链路自检：验证能否成功合成系统媒体事件（不实际投递，避免干扰播放）
+            NSEvent *probe = [NSEvent otherEventWithType:NSEventTypeSystemDefined
+                                                location:NSZeroPoint modifierFlags:0 timestamp:0
+                                            windowNumber:0 context:nil
+                                                 subtype:NX_SUBTYPE_AUX_CONTROL_BUTTONS
+                                                   data1:((long)NX_KEYTYPE_PLAY << 16) | 0x0A00
+                                                   data2:-1];
+            printf("  F7~F9 播放控制转发：媒体事件合成 %s\n", probe.CGEvent ? "成功" : "失败");
+        }
         fflush(stdout);
         exit(0);
     }
@@ -1187,9 +1245,16 @@ static const CGFloat kOSD_H = 44;
         printf("菜单项数=%lu\n", (unsigned long)m.numberOfItems);
         for (NSMenuItem *it in m.itemArray) {
             const char *t = it.title.length ? it.title.UTF8String : "(分隔线)";
-            printf("  - %s%s%s\n", t,
-                   it.submenu ? "  ▸" : "",
-                   it.view ? "  [滑块视图]" : "");
+            if (it.submenu) {
+                NSInteger usable = 0;
+                for (NSMenuItem *si in it.submenu.itemArray) if (si.enabled) usable++;
+                printf("  - %s  ▸ (共 %lu 项，可用 %ld)\n", t,
+                       (unsigned long)it.submenu.numberOfItems, (long)usable);
+            } else {
+                printf("  - %s%s%s\n", t,
+                       it.submenu ? "  ▸" : "",
+                       it.view ? "  [滑块视图]" : "");
+            }
         }
         printf("已注册全局热键=%lu / 配置项=%lu\n",
                (unsigned long)self.hotKeyRefs.count, (unsigned long)HotkeyKeys().count);
@@ -1212,6 +1277,8 @@ static const CGFloat kOSD_H = 44;
         for (NSTabViewItem *t in self.tabView.tabViewItems)
             printf("  - 标签: %s  子视图=%lu\n", t.label.UTF8String,
                    (unsigned long)t.view.subviews.count);
+        printf("系统设置读取: 标准功能键=%s\n",
+               [self systemStandardFnKeysEnabled] ? "开" : "关");
         printf("快捷键输入框=%lu  步长/分辨率输入框=%lu  显示项勾选框=%lu\n",
                (unsigned long)self.hkFields.count,
                (unsigned long)self.optFields.count,
@@ -1518,14 +1585,20 @@ static const CGFloat kOSD_H = 44;
 }
 
 // SF Symbol 图标（名字写错就返回 nil，菜单自然无图标，安全）
+// 【关键】必须设 template = YES：否则系统按 SF Symbol 原色（近乎黑）绘制，
+// 在深色菜单里就是"一团黑"，看起来像禁用状态。
 - (NSImage *)symImage:(NSString *)name {
     NSImage *img = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
     if (!img) return nil;
+    NSImageSymbolConfiguration *cfg =
+        [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular];
+    NSImage *styled = [img imageWithSymbolConfiguration:cfg] ?: img;
     NSImage *sz = [[NSImage alloc] initWithSize:NSMakeSize(14, 14)];
     [sz lockFocus];
-    [img drawInRect:NSMakeRect(0, 0, 14, 14) fromRect:NSZeroRect
-          operation:NSCompositingOperationSourceOver fraction:1.0];
+    [styled drawInRect:NSMakeRect(0, 0, 14, 14) fromRect:NSZeroRect
+             operation:NSCompositingOperationSourceOver fraction:1.0];
     [sz unlockFocus];
+    sz.template = YES;      // ← 跟随菜单前景色（深色菜单里显白）
     return sz;
 }
 
@@ -1536,6 +1609,7 @@ static const CGFloat kOSD_H = 44;
 
     NSImageView *ic = [[NSImageView alloc] initWithFrame:NSMakeRect(10, 15, 16, 16)];
     ic.image = [self symImage:active ? @"display" : @"rectangle.dashed"];
+    ic.contentTintColor = [NSColor labelColor];   // 自定义视图里的模板图需显式着色，否则可能显黑
     if (ic.image) [box addSubview:ic];
 
     NSTextField *lab = [[NSTextField alloc] initWithFrame:NSMakeRect(34, 21, 208, 18)];
@@ -1589,6 +1663,7 @@ static const CGFloat kOSD_H = 44;
     NSString *sym = (vcp == 0x10) ? @"sun.max" : @"speaker.wave.2";
     NSImageView *iv = [[NSImageView alloc] initWithFrame:NSMakeRect(14, 12, 14, 14)];
     iv.image = [self symImage:sym];
+    iv.contentTintColor = [NSColor labelColor];
     if (iv.image) [box addSubview:iv];
 
     CGFloat labX = iv.image ? 34 : 14;
@@ -1961,7 +2036,7 @@ static const CGFloat kOSD_H = 44;
 }
 
 - (void)buildSettingsWindow {
-    NSRect frame = NSMakeRect(0, 0, 580, 460);
+    NSRect frame = NSMakeRect(0, 0, 580, 520);
     NSWindow *w = [[NSWindow alloc] initWithContentRect:frame
                                              styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
                                                backing:NSBackingStoreBuffered
@@ -1975,7 +2050,7 @@ static const CGFloat kOSD_H = 44;
     [w center];
     self.settingsWindow = w;
 
-    NSTabView *tv = [[NSTabView alloc] initWithFrame:NSMakeRect(12, 12, 556, 436)];
+    NSTabView *tv = [[NSTabView alloc] initWithFrame:NSMakeRect(12, 12, 556, 496)];
     self.tabView = tv;
     [w.contentView addSubview:tv];
 
@@ -1986,9 +2061,9 @@ static const CGFloat kOSD_H = 44;
     // ---- 常规 ----
     NSTabViewItem *t1 = [[NSTabViewItem alloc] initWithIdentifier:@"general"];
     t1.label = @"常规";
-    NSView *v1 = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, 400)];
-    [v1 addSubview:[self label:@"状态" frame:NSMakeRect(20, 366, 200, 18) bold:YES]];
-    self.statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 222, 500, 138)];
+    NSView *v1 = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, 460)];
+    [v1 addSubview:[self label:@"状态" frame:NSMakeRect(20, 424, 200, 18) bold:YES]];
+    self.statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 280, 500, 138)];
     self.statusLabel.bezeled = NO; self.statusLabel.editable = NO; self.statusLabel.drawsBackground = NO;
     self.statusLabel.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
     self.statusLabel.stringValue = @"读取中…";
@@ -1996,39 +2071,39 @@ static const CGFloat kOSD_H = 44;
 
     self.mediaKeyCheck = [NSButton checkboxWithTitle:@"接管妙控键盘原生亮度 / 音量键（推荐开启）"
                                               target:self action:@selector(onToggleMediaKeys:)];
-    self.mediaKeyCheck.frame = NSMakeRect(20, 190, 400, 22);
+    self.mediaKeyCheck.frame = NSMakeRect(20, 248, 400, 22);
     self.mediaKeyCheck.state = [gConf[@"mediaKeys"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
     [v1 addSubview:self.mediaKeyCheck];
 
     self.loginCheck = [NSButton checkboxWithTitle:@"开机自动启动" target:self action:@selector(onToggleLogin:)];
-    self.loginCheck.frame = NSMakeRect(20, 164, 160, 22);
+    self.loginCheck.frame = NSMakeRect(20, 222, 160, 22);
     self.loginCheck.state = [gConf[@"launchAtLogin"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
     [v1 addSubview:self.loginCheck];
 
     self.brightMouseCheck = [NSButton checkboxWithTitle:@"亮度跟随鼠标所在屏幕（不勾则只调主屏）"
                                                  target:self action:@selector(onToggleBrightMouse:)];
-    self.brightMouseCheck.frame = NSMakeRect(200, 164, 330, 22);
+    self.brightMouseCheck.frame = NSMakeRect(200, 222, 330, 22);
     self.brightMouseCheck.state = [gConf[@"brightnessTarget"] isEqualToString:@"mouse"] ? NSControlStateValueOn : NSControlStateValueOff;
     [v1 addSubview:self.brightMouseCheck];
 
     // 布局快照 / 应急恢复 已移到「高级」页（用户要求常规页保持简洁）
     [v1 addSubview:[self label:@"更多设置见「高级」页；菜单显示项可在「菜单显示项」页调整。"
-                        frame:NSMakeRect(20, 122, 500, 18) bold:NO]];
+                        frame:NSMakeRect(20, 180, 500, 18) bold:NO]];
     [v1 addSubview:[self label:[NSString stringWithFormat:@"当前版本 v%@ · 开发者 %@", APP_VERSION, APP_AUTHOR]
-                        frame:NSMakeRect(20, 60, 500, 18) bold:NO]];
+                        frame:NSMakeRect(20, 118, 500, 18) bold:NO]];
     t1.view = v1;
     [tv addTabViewItem:t1];
 
     // ---- 菜单显示项 ----
     NSTabViewItem *t2 = [[NSTabViewItem alloc] initWithIdentifier:@"menu"];
     t2.label = @"菜单显示项";
-    NSView *v2 = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, 400)];
-    [v2 addSubview:[self label:@"勾选要在菜单里出现的控制项" frame:NSMakeRect(20, 358, 300, 18) bold:YES]];
+    NSView *v2 = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, 460)];
+    [v2 addSubview:[self label:@"勾选要在菜单里出现的控制项" frame:NSMakeRect(20, 416, 300, 18) bold:YES]];
     NSArray *showKeys = @[@"showBrightness", @"showVolume", @"showResolution", @"showRate", @"showHiDPI", @"showOSD"];
     NSArray *showTitles = @[@"亮度滑块", @"音量滑块", @"分辨率子菜单", @"刷新率子菜单", @"高分辨率 (HiDPI)", @"调节动画 OSD 浮层（异常可关）"];
     for (NSUInteger i = 0; i < showKeys.count; i++) {
         NSButton *c = [NSButton checkboxWithTitle:showTitles[i] target:nil action:nil];
-        c.frame = NSMakeRect(20, 320 - (NSInteger)i * 30, 300, 22);
+        c.frame = NSMakeRect(20, 378 - (NSInteger)i * 30, 300, 22);
         c.state = [gConf[showKeys[i]] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
         [v2 addSubview:c];
         self.showChecks[showKeys[i]] = c;
@@ -2040,45 +2115,58 @@ static const CGFloat kOSD_H = 44;
     // （"快捷键"页已按用户要求移除——那些全局热键用不上，键位也不再需要配置）
     NSTabViewItem *t4 = [[NSTabViewItem alloc] initWithIdentifier:@"advanced"];
     t4.label = @"高级";
-    NSView *v4 = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, 400)];
+    NSView *v4 = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, 460)];
 
-    [v4 addSubview:[self label:@"每次按键的增减幅度" frame:NSMakeRect(20, 358, 300, 18) bold:YES]];
-    [v4 addSubview:[self label:@"亮度" frame:NSMakeRect(20, 328, 60, 18) bold:NO]];
-    NSTextField *sb = [[NSTextField alloc] initWithFrame:NSMakeRect(80, 325, 60, 22)];
+    [v4 addSubview:[self label:@"每次按键的增减幅度" frame:NSMakeRect(20, 432, 300, 18) bold:YES]];
+    [v4 addSubview:[self label:@"亮度" frame:NSMakeRect(20, 404, 60, 18) bold:NO]];
+    NSTextField *sb = [[NSTextField alloc] initWithFrame:NSMakeRect(80, 401, 60, 22)];
     sb.stringValue = gConf[@"stepBrightness"];
     [v4 addSubview:sb];
     self.optFields[@"stepBrightness"] = sb;
-    [v4 addSubview:[self label:@"%(亮度)" frame:NSMakeRect(146, 328, 80, 18) bold:NO]];
-    [v4 addSubview:[self label:@"音量" frame:NSMakeRect(240, 328, 60, 18) bold:NO]];
-    NSTextField *sv = [[NSTextField alloc] initWithFrame:NSMakeRect(300, 325, 60, 22)];
+    [v4 addSubview:[self label:@"%(亮度)" frame:NSMakeRect(146, 404, 80, 18) bold:NO]];
+    [v4 addSubview:[self label:@"音量" frame:NSMakeRect(240, 404, 60, 18) bold:NO]];
+    NSTextField *sv = [[NSTextField alloc] initWithFrame:NSMakeRect(300, 401, 60, 22)];
     sv.stringValue = gConf[@"stepVolume"];
     [v4 addSubview:sv];
     self.optFields[@"stepVolume"] = sv;
-    [v4 addSubview:[self label:@"%(音量)" frame:NSMakeRect(366, 328, 80, 18) bold:NO]];
+    [v4 addSubview:[self label:@"%(音量)" frame:NSMakeRect(366, 404, 80, 18) bold:NO]];
 
     NSButton *save = [NSButton buttonWithTitle:@"保存并重新加载" target:self action:@selector(onSaveSettings:)];
-    save.frame = NSMakeRect(20, 280, 160, 26);
+    save.frame = NSMakeRect(20, 366, 160, 26);
     [v4 addSubview:save];
     NSButton *open = [NSButton buttonWithTitle:@"打开配置文件" target:self action:@selector(onOpenConf:)];
-    open.frame = NSMakeRect(190, 280, 140, 26);
+    open.frame = NSMakeRect(190, 366, 140, 26);
     [v4 addSubview:open];
 
-    [v4 addSubview:[self label:@"屏幕旋转" frame:NSMakeRect(20, 236, 200, 18) bold:YES]];
-    [v4 addSubview:[self label:@"本机 Apple Silicon 较新版 macOS 未导出私有旋转接口，工具内无法旋转。" frame:NSMakeRect(20, 218, 500, 18) bold:NO]];
-    [v4 addSubview:[self label:@"请到 系统设置 → 显示器 → 旋转 里手动调整。" frame:NSMakeRect(20, 200, 500, 18) bold:NO]];
+    // ---- 键盘与功能键（直接写入系统设置，用户无需手动打开系统设置）----
+    [v4 addSubview:[self label:@"键盘与功能键" frame:NSMakeRect(20, 326, 300, 18) bold:YES]];
+
+    NSButton *stdFn = [NSButton checkboxWithTitle:@"将 F1/F2 作为标准功能键（可直接调节亮度，蓝牙键盘需开关重连）"
+                                           target:self action:@selector(onToggleStandardFnKeys:)];
+    stdFn.frame = NSMakeRect(20, 296, 480, 22);
+    stdFn.state = [self systemStandardFnKeysEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    [v4 addSubview:stdFn];
+
+    NSButton *playKeys = [NSButton checkboxWithTitle:@"F7 / F8 / F9 直按控制播放（上一曲 / 播放暂停 / 下一曲）"
+                                              target:self action:@selector(onToggleFnPlayback:)];
+    playKeys.frame = NSMakeRect(20, 266, 480, 22);
+    playKeys.state = [gConf[@"fnPlaybackKeys"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+    [v4 addSubview:playKeys];
+
+
 
     // ---- 布局快照 / 应急恢复（从「常规」页移过来，用户要求常规页保持简洁）----
-    [v4 addSubview:[self label:@"布局快照" frame:NSMakeRect(20, 158, 200, 18) bold:YES]];
+    [v4 addSubview:[self label:@"布局快照" frame:NSMakeRect(20, 226, 200, 18) bold:YES]];
     NSButton *bSnap = [NSButton buttonWithTitle:@"保存当前布局快照" target:self action:@selector(onLayoutSave:)];
-    bSnap.frame = NSMakeRect(20, 124, 170, 26);
+    bSnap.frame = NSMakeRect(20, 192, 170, 26);
     [v4 addSubview:bSnap];
     NSButton *bRestore = [NSButton buttonWithTitle:@"按快照还原布局" target:self action:@selector(onLayoutRestore:)];
-    bRestore.frame = NSMakeRect(200, 124, 170, 26);
+    bRestore.frame = NSMakeRect(200, 192, 170, 26);
     [v4 addSubview:bRestore];
 
-    [v4 addSubview:[self label:@"应急恢复" frame:NSMakeRect(20, 86, 200, 18) bold:YES]];
+    [v4 addSubview:[self label:@"应急恢复" frame:NSMakeRect(20, 152, 200, 18) bold:YES]];
     NSButton *bAll = [NSButton buttonWithTitle:@"连回所有显示器" target:self action:@selector(onRestoreAll:)];
-    bAll.frame = NSMakeRect(20, 52, 160, 26);
+    bAll.frame = NSMakeRect(20, 118, 160, 26);
     [v4 addSubview:bAll];
 
     t4.view = v4;
@@ -2146,6 +2234,54 @@ static const CGFloat kOSD_H = 44;
     if (![[NSFileManager defaultManager] fileExistsAtPath:ConfPath()]) SaveConf();
     [[NSWorkspace sharedWorkspace] openFile:ConfPath() withApplication:@"TextEdit"];
 }
+
+// F7/F8/F9 直按控制播放（转发为系统媒体事件）；关闭后这几个键原样交给前端应用
+- (void)onToggleFnPlayback:(NSButton *)sender {
+    gConf[@"fnPlaybackKeys"] = (sender.state == NSControlStateValueOn) ? @"1" : @"0";
+    SaveConf();
+    NDLog(@"[conf] F7~F9 播放控制转发 = %@", gConf[@"fnPlaybackKeys"]);
+}
+
+#pragma mark - 直接读写系统键盘设置（免去用户手动去系统设置）
+// 【重要】用 CFPreferences API 直接读写，不要调 /usr/bin/defaults 子进程、更不要 killall cfprefsd：
+// 前者会阻塞主线程（界面点击后卡住/转圈），后者会让全系统偏好读写短暂失效。
+
+static id NDReadPref(NSString *domain, NSString *key) {
+    CFStringRef k = (__bridge CFStringRef)key;
+    CFPropertyListRef v = NULL;
+    if ([domain isEqualToString:@"-g"])
+        v = CFPreferencesCopyValue(k, kCFPreferencesAnyApplication,
+                                   kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    else
+        v = CFPreferencesCopyValue(k, (__bridge CFStringRef)domain,
+                                   kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    return v ? (__bridge_transfer id)v : nil;
+}
+
+static void NDWritePref(NSString *domain, NSString *key, id value) {
+    CFStringRef k = (__bridge CFStringRef)key;
+    CFStringRef d = [domain isEqualToString:@"-g"] ? kCFPreferencesAnyApplication
+                                                   : (__bridge CFStringRef)domain;
+    CFPreferencesSetValue(k, (__bridge CFPropertyListRef)value, d,
+                          kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    CFPreferencesAppSynchronize(d);
+}
+
+// 系统当前是否已开启"将 F1、F2 等键用作标准功能键"（该键在全局域）
+- (BOOL)systemStandardFnKeysEnabled {
+    id v = NDReadPref(@"-g", @"com.apple.keyboard.fnState");
+    if (!v) v = NDReadPref(@"com.apple.HIToolbox", @"com.apple.keyboard.fnState");
+    return v ? ([v intValue] != 0) : NO;
+}
+
+// 勾选/取消"将 F1、F2 等键用作标准功能键"（两个域都写，确保系统与设置界面都同步）
+- (void)onToggleStandardFnKeys:(NSButton *)sender {
+    BOOL on = (sender.state == NSControlStateValueOn);
+    NDWritePref(@"-g", @"com.apple.keyboard.fnState", @(on));
+    NDWritePref(@"com.apple.HIToolbox", @"com.apple.keyboard.fnState", @(on));
+    NDLog(@"[syspref] 标准功能键 = %d（已写入全局域 + HIToolbox 域）", on);
+}
+
 
 - (void)onSaveSettings:(id)sender {
     for (NSString *k in self.hkFields) gConf[k] = ((NSTextField *)self.hkFields[k]).stringValue;

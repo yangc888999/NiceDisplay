@@ -735,9 +735,17 @@ static void cmd_info(void) {
         printf("display id=%u main=%d active=%d ddc=%d uuid=%s name=%s\n",
                d.id, d.main, d.active, svc ? 1 : 0, d.uuid[0] ? d.uuid : "-", nm[0] ? nm : "(未知)");
         if (svc) {
+            // DDC 回读偶发失败（尤其部分华为/第三方屏）→ 重试几次再放弃，
+            // 否则上层拿不到基准值会跳过调节（表现为"按了没反应"）
             uint16_t cur = 0, max = 0;
-            if (ddc_get(svc, 0x10, &cur, &max) == 0) printf("brightness cur=%u max=%u\n", cur, max);
-            if (ddc_get(svc, 0x62, &cur, &max) == 0) printf("volume cur=%u max=%u\n", cur, max);
+            for (int t = 0; t < 3; t++) {
+                if (ddc_get(svc, 0x10, &cur, &max) == 0) { printf("brightness cur=%u max=%u\n", cur, max); break; }
+                usleep(60000);
+            }
+            for (int t = 0; t < 3; t++) {
+                if (ddc_get(svc, 0x62, &cur, &max) == 0) { printf("volume cur=%u max=%u\n", cur, max); break; }
+                usleep(60000);
+            }
             CFRelease(svc);
         }
         CGDisplayModeRef m = CGDisplayCopyDisplayMode(d.id);
