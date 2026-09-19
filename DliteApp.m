@@ -66,6 +66,9 @@ static NSDictionary *DefaultConf(void) {
         @"mediaKeys": @"1",
         // F7/F8/F9 直按控制播放（在 tap 里把标准键码转发成系统媒体事件）；关闭则原样放行
         @"fnPlaybackKeys": @"1",
+        // 音量键智能分流：当前音频输出不是显示器（蓝牙耳机/音箱、内置扬声器等）时，
+        // 把 F10/F11/F12 转发成系统音量媒体键，而不是去改显示器 DDC 音量。
+        @"volKeySmartRoute": @"1",
         @"mediaVolumeTarget": @"audio",
         // 亮度键作用屏：main=主屏（默认，与旧版行为一致） mouse=鼠标所在屏 或直接填显示器 id
         @"brightnessTarget": @"main",
@@ -378,7 +381,8 @@ static NSArray *FetchDisabledIDs(void) {
     NSMutableArray *a = [NSMutableArray array];
     for (NSString *raw in [RunCLI(@[@"disabled"]) componentsSeparatedByString:@"\n"]) {
         NSString *l = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        if ([l hasPrefix:@"disabled id="]) [a addObject:[l substringFromIndex:12]];
+        // 每行格式: disabled <uuid>[<TAB>显示器名]
+        if ([l hasPrefix:@"disabled "]) [a addObject:[l substringFromIndex:9]];
     }
     return a;
 }
@@ -441,7 +445,9 @@ static OSStatus HotkeyHandler(EventHandlerCallRef nextRef, EventRef ev, void *ct
 @property (nonatomic, strong) NSMutableDictionary *showChecks;
 @property (nonatomic, strong) NSButton *loginCheck;
 @property (nonatomic, strong) NSButton *brightMouseCheck;
-@property (nonatomic, strong) NSMutableDictionary *dispNameCache;   // did字符串 → 显示器名（断开后灰显用）
+@property (nonatomic, strong) NSMutableDictionary *dispNameCache;
+// 显示器 UUID → 名字（关闭显示器后系统会重新分配 display id，只有 UUID 能查出真实名字）
+@property (nonatomic, strong) NSMutableDictionary *dispNameByUUID;   // did字符串 → 显示器名（断开后灰显用）
 @property (nonatomic, strong) NSTextField *statusLabel;
 @property (nonatomic) CFMachPortRef mediaTap;
 @property (nonatomic) BOOL mediaUnauthorized;
@@ -466,6 +472,7 @@ static OSStatus HotkeyHandler(EventHandlerCallRef nextRef, EventRef ev, void *ct
 @property (nonatomic, copy) NSString *sliderPendingIdent;
 // 菜单是否展开（用于媒体键后同步菜单内滑块）
 @property (nonatomic) BOOL menuIsOpen;
+@property (nonatomic) BOOL menuBuilding;   // 菜单构建中（防重入：被打断会渲染出残缺菜单）
 @end
 
 @implementation AppDelegate
@@ -493,6 +500,61 @@ static OSStatus HotkeyHandler(EventHandlerCallRef nextRef, EventRef ev, void *ct
 }
 
 // 音量键 / 静音键该作用在哪块屏
+// 前向声明：系统音量辅助函数（具体定义见 ndPostMediaKey 之前）
+static AudioDeviceID ndDefaultOutput(void);
+static float ndSystemVolume(void);
+static void ndSetSystemVolume(float v);
+static BOOL ndSystemMuted(void);
+static void ndSetSystemMute(BOOL on);
+static BOOL ndDefaultOutputIsDisplay(void);
+
+// 当前默认音频输出是不是"我们管理的某块显示器"。
+// 主判据是传输类型（dprt/hdmi=显示器音频），比"名字匹配"稳得多 ——
+// 显示器名(QSN-CBB)和音频设备全名(HUAWEI MateView GT)经常对不上，名字匹配是坑。
+// 名字匹配仅作兜底。
+- (BOOL)audioOutputIsDisplay {
+    if (ndDefaultOutputIsDisplay()) return YES;          // DisplayPort/HDMI → 一定是显示器
+    NSString *dev = self.audioDeviceName.length ? self.audioDeviceName : DefaultOutputDeviceName();
+    if (!dev.length) return NO;
+    for (DlDisp *d in self.displays) {
+        NSString *nm = [d displayName];
+        if (!nm.length) continue;
+        if ([nm isEqualToString:dev]
+            || [dev rangeOfString:nm].location != NSNotFound
+            || [nm rangeOfString:dev].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+// 音量/静音键分流：
+//   音频输出 = 显示器（DP/HDMI）→ 走 DDC（原行为，显示器自带喇叭）
+//   音频输出 ≠ 显示器（蓝牙耳机/音箱/内置扬声器）→ 直接调系统主音量（CoreAudio 直写，不合成媒体键）
+// 返回 YES 表示已在本方法内处理完毕（performAction 不再走 DDC）。
+- (BOOL)routeVolumeKeyToSystem:(int)act {
+    if (![gConf[@"volKeySmartRoute"] boolValue]) return NO;   // 关掉智能分流则始终走 DDC
+    if ([self audioOutputIsDisplay]) return NO;               // 输出是显示器 → 交给 DDC 处理
+
+    // 非显示器输出：直接改系统主音量。
+    // 注意：绝不能再 ndPostMediaKey 合成媒体键 —— 它投递到 HID 层会被本程序自己的 tap 回收，
+    // dispatchMediaKey 又调回 performAction → 再 ndPostMediaKey → 死循环且系统永远收不到（表现为按键没反应）。
+    if (act == -1) {                                          // 静音切换（F10）
+        ndSetSystemMute(!ndSystemMuted());
+        int mpct = ndSystemMuted() ? 0 : (int)(ndSystemVolume() * 100 + 0.5);
+        [self showOSD:@"音量" pct:mpct screen:nil];           // 弹音量条（静音时显示 0%）
+        NDLog(@"[vol] 非显示器输出 → 系统静音切换 muted=%d", ndSystemMuted());
+        return YES;
+    }
+    float cur = ndSystemVolume();
+    if (cur < 0) { NDLog(@"[vol] 读取系统音量失败"); return YES; }
+    int stepPct = [gConf[@"stepVolume"] intValue]; if (stepPct <= 0) stepPct = 2;
+    float step = stepPct / 100.0f;
+    float tgt = MIN(MAX(cur + (act == ActVolUp ? step : -step), 0.0f), 1.0f);
+    ndSetSystemVolume(tgt);
+    [self showOSD:@"音量" pct:(int)(tgt * 100 + 0.5) screen:nil];   // 弹音量条，让用户看到当前音量
+    NDLog(@"[vol] 非显示器输出 → 系统音量 %d%%→%d%%", (int)(cur*100+0.5), (int)(tgt*100+0.5));
+    return YES;
+}
+
 - (DlDisp *)volumeTargetDisp {
     NSString *t = gConf[@"mediaVolumeTarget"];
     if (t.length == 0 || [t isEqualToString:@"main"]) return [self mainDisp];
@@ -545,6 +607,57 @@ static void NDLog(NSString *fmt, ...) {
         [[NSFileManager defaultManager] createFileAtPath:@"/tmp/nd_debug.log" contents:nil attributes:nil];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:@"/tmp/nd_debug.log"];
     [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile];
+}
+
+// ---- 系统主音量（CoreAudio 直读直写）----
+// 用于"音频输出不是显示器"（蓝牙耳机/音箱/内置扬声器）时的 F11/F12 音量调节。
+// 直接改系统输出音量，不合成媒体键 —— 否则事件会被本程序自己的 HID tap 回收 → 死循环、系统也收不到。
+#ifndef kAudioHardwareServiceDeviceProperty_VirtualMasterVolume
+#define kAudioHardwareServiceDeviceProperty_VirtualMasterVolume 'vmvc'
+#endif
+#ifndef kAudioObjectUnknown
+#define kAudioObjectUnknown 0xFFFFFFFF
+#endif
+static AudioDeviceID ndDefaultOutput(void) {
+    AudioDeviceID dev = kAudioObjectUnknown; UInt32 sz = sizeof(dev);
+    AudioObjectPropertyAddress a = { kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &sz, &dev)) return kAudioObjectUnknown;
+    return dev;
+}
+static float ndSystemVolume(void) {
+    AudioDeviceID dev = ndDefaultOutput(); if (dev == kAudioObjectUnknown) return -1;
+    Float32 v = 0; UInt32 sz = sizeof(v);
+    AudioObjectPropertyAddress vol = { kAudioHardwareServiceDeviceProperty_VirtualMasterVolume, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain };
+    if (AudioObjectGetPropertyData(dev, &vol, 0, NULL, &sz, &v)) return -1;
+    return v;
+}
+static void ndSetSystemVolume(float v) {
+    v = MIN(MAX(v, 0.0f), 1.0f);
+    AudioDeviceID dev = ndDefaultOutput(); if (dev == kAudioObjectUnknown) return;
+    Float32 fv = v; UInt32 sz = sizeof(fv);
+    AudioObjectPropertyAddress vol = { kAudioHardwareServiceDeviceProperty_VirtualMasterVolume, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain };
+    AudioObjectSetPropertyData(dev, &vol, 0, NULL, sz, &fv);
+}
+static BOOL ndSystemMuted(void) {
+    AudioDeviceID dev = ndDefaultOutput(); if (dev == kAudioObjectUnknown) return NO;
+    UInt32 m = 0; UInt32 sz = sizeof(m);
+    AudioObjectPropertyAddress mut = { kAudioDevicePropertyMute, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain };
+    if (AudioObjectGetPropertyData(dev, &mut, 0, NULL, &sz, &m)) return NO;
+    return m ? YES : NO;
+}
+static void ndSetSystemMute(BOOL on) {
+    AudioDeviceID dev = ndDefaultOutput(); if (dev == kAudioObjectUnknown) return;
+    UInt32 m = on ? 1 : 0; UInt32 sz = sizeof(m);
+    AudioObjectPropertyAddress mut = { kAudioDevicePropertyMute, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain };
+    AudioObjectSetPropertyData(dev, &mut, 0, NULL, sz, &m);
+}
+// 默认输出设备的传输类型：dprt=DisplayPort(0x64707274) / hdmi=HDMI(0x68646d69) → 显示器音频
+static BOOL ndDefaultOutputIsDisplay(void) {
+    AudioDeviceID dev = ndDefaultOutput(); if (dev == kAudioObjectUnknown) return NO;
+    UInt32 tt = 0; UInt32 sz = sizeof(tt);
+    AudioObjectPropertyAddress t = { kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    if (AudioObjectGetPropertyData(dev, &t, 0, NULL, &sz, &tt)) return NO;
+    return (tt == 0x64707274 || tt == 0x68646d69);
 }
 
 // 合成一个系统媒体键事件并投递到 HID 层（让系统/播放器当作真按了媒体键处理）
@@ -779,9 +892,10 @@ static CGEventRef mediaTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)doMute {
+    if ([self routeVolumeKeyToSystem:-1]) return;            // 输出不是显示器 → 转发系统静音键
     DlDisp *d = [self volumeTargetDisp];
     if (!d) return;
-    RunCLIAsync(@[@"mute", [NSString stringWithFormat:@"%d", d.did]], ^(NSString *o) { [self refreshAsync]; });
+    RunCLIAsync(@[@"mute", [NSString stringWithFormat:@"%d", d.did]], ^(NSString *o) { [self refreshNow]; });
 }
 
 - (BOOL)detectBetterDisplay {
@@ -821,16 +935,60 @@ static NSEvent *FakeMediaKey(int keyCode, BOOL isDown) {
     NSString *audio = DefaultOutputDeviceName();
     dispatch_async(dispatch_get_main_queue(), ^{
         self.displays = d;
-        self.disabledIDs = dis;
+        self.disabledIDs = [self splitDisabled:dis];
         self.betterDisplayRunning = bd;
         self.audioDeviceName = audio;
         self.lastRefresh = [NSDate date];
         if (!self.dispNameCache) self.dispNameCache = [NSMutableDictionary dictionary];
         for (DlDisp *x in d)
             self.dispNameCache[[NSString stringWithFormat:@"%d", x.did]] = [x displayName];
+        [self rememberDisplayNames:d];
         [self updateStatusLabel];
         [self syncOpenMenuSliders];
     });
+}
+
+// 记住"显示器 UUID → 名字"并写进配置：关闭显示器后 did 会变，靠它显示真实名字
+- (void)rememberDisplayNames:(NSArray *)disp {
+    if (!self.dispNameByUUID) self.dispNameByUUID = [NSMutableDictionary dictionary];
+    BOOL dirty = NO;
+    for (DlDisp *x in disp) {
+        if (!x.uuid.length) continue;
+        NSString *nm = [x displayName];
+        if (nm.length && ![nm isEqualToString:self.dispNameByUUID[x.uuid]]) {
+            self.dispNameByUUID[x.uuid] = nm;
+            dirty = YES;
+        }
+    }
+    if (dirty) {
+        NSMutableArray *pairs = [NSMutableArray array];
+        for (NSString *k in self.dispNameByUUID)
+            [pairs addObject:[NSString stringWithFormat:@"%@=%@", k, self.dispNameByUUID[k]]];
+        gConf[@"dispNames"] = [pairs componentsJoinedByString:@";"];
+        SaveConf();
+    }
+}
+
+// dlite disabled 每行是 "uuid<TAB>名字"，拆开并把名字记进 UUID→名字表
+- (NSArray *)splitDisabled:(NSArray *)raw {
+    NSMutableArray *ids = [NSMutableArray array];
+    if (!self.dispNameByUUID) self.dispNameByUUID = [NSMutableDictionary dictionary];
+    for (NSString *line in raw) {
+        NSArray *parts = [line componentsSeparatedByString:@"\t"];
+        NSString *u = parts.firstObject ?: @"";
+        if (!u.length) continue;
+        if (parts.count > 1 && [(NSString *)parts[1] length]) self.dispNameByUUID[u] = parts[1];
+        [ids addObject:u];
+    }
+    return ids;
+}
+
+- (void)loadDisplayNames {
+    self.dispNameByUUID = [NSMutableDictionary dictionary];
+    for (NSString *pair in [gConf[@"dispNames"] componentsSeparatedByString:@";"]) {
+        NSArray *kv = [pair componentsSeparatedByString:@"="];
+        if (kv.count == 2 && [kv[0] length]) self.dispNameByUUID[kv[0]] = kv[1];
+    }
 }
 
 - (void)refreshAsync {
@@ -846,8 +1004,9 @@ static NSEvent *FakeMediaKey(int keyCode, BOOL isDown) {
     if (!self.dispNameCache) self.dispNameCache = [NSMutableDictionary dictionary];
     for (DlDisp *x in d)
         self.dispNameCache[[NSString stringWithFormat:@"%d", x.did]] = [x displayName];
+    [self rememberDisplayNames:d];
     self.displays = d;
-    self.disabledIDs = dis;
+    self.disabledIDs = [self splitDisabled:dis];
     self.betterDisplayRunning = bd;
     self.audioDeviceName = audio;
     self.lastRefresh = [NSDate date];
@@ -1121,6 +1280,7 @@ static const CGFloat kOSD_H = 44;
 
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
     LoadConf();
+    [self loadDisplayNames];
     self.hotKeyRefs = [NSMutableArray array];
     self.displays = @[];
     self.disabledIDs = @[];
@@ -1169,6 +1329,9 @@ static const CGFloat kOSD_H = 44;
         printf("  默认音频输出设备 = %s\n", self.audioDeviceName.UTF8String ?: "(空)");
         printf("  亮度键作用屏幕   = %s (id=%d)\n", md ? [md displayName].UTF8String : "(无)", md ? md.did : -1);
         printf("  音量键作用屏幕   = %s (id=%d)\n", vd ? [vd displayName].UTF8String : "(无)", vd ? vd.did : -1);
+        printf("  当前音频输出是否显示器 = %s → 音量键%s\n",
+               [self audioOutputIsDisplay] ? "是" : "否（耳机/音箱等）",
+               [self audioOutputIsDisplay] ? "写显示器 DDC" : "转发系统音量键");
         printf("  CGEventTap=%s%s （真实抓取依赖它 + 辅助功能权限，需真实按键验证）\n",
                self.mediaTap ? "已安装" : "未安装",
                self.mediaUnauthorized ? "（缺辅助功能权限）" : "");
@@ -1253,7 +1416,23 @@ static const CGFloat kOSD_H = 44;
             } else {
                 printf("  - %s%s%s\n", t,
                        it.submenu ? "  ▸" : "",
-                       it.view ? "  [滑块视图]" : "");
+                       it.view ? "  [自定义视图]" : "");
+                if (it.view) {
+                    printf("       itemView.frame=%s  hidden=%d  subviews=%lu\n",
+                           NSStringFromRect(it.view.frame).UTF8String,
+                           it.hidden ? 1 : 0, (unsigned long)it.view.subviews.count);
+                    for (NSView *sv in it.view.subviews) {
+                        NSString *txt = [sv isKindOfClass:[NSTextField class]]
+                                        ? [(NSTextField *)sv stringValue] : @"";
+                        NSColor *col = [sv isKindOfClass:[NSTextField class]]
+                                       ? [(NSTextField *)sv textColor] : nil;
+                        printf("         %-14s frame=%-22s text=%-14s color=%s\n",
+                               NSStringFromClass([sv class]).UTF8String,
+                               NSStringFromRect(sv.frame).UTF8String,
+                               txt.UTF8String ?: "",
+                               col ? [[col description] UTF8String] : "-");
+                    }
+                }
             }
         }
         printf("已注册全局热键=%lu / 配置项=%lu\n",
@@ -1424,12 +1603,25 @@ static const CGFloat kOSD_H = 44;
         }
         case ActVolUp:
         case ActVolDown: {
+            if ([self routeVolumeKeyToSystem:act]) return;   // 输出不是显示器 → 转发系统音量键
             DlDisp *vd2 = [self volumeTargetDisp];
             if (!vd2) return;
             int mx = 0;
             int cur = [self currentLevelForDisp:vd2 vcp:0x62 max:&mx];
             if (cur < 0) {
-                NDLog(@"[perf] 音量无基准值，跳过本次（避免跳到错误值）");
+                // 显示器 DDC 音量读不到（不支持 DDC 音量 / 临时读失败）→ 退回系统主音量直写，
+                // 保证"经显示器透传的音箱"等场景快捷键仍可用，不会被卡死。
+                float sc = ndSystemVolume();
+                if (sc >= 0) {
+                    int stepPct = [gConf[@"stepVolume"] intValue]; if (stepPct <= 0) stepPct = 2;
+                    float step = stepPct / 100.0f;
+                    float st = MIN(MAX(sc + (act == ActVolUp ? step : -step), 0.0f), 1.0f);
+                    ndSetSystemVolume(st);
+                    [self showOSD:@"音量" pct:(int)(st * 100 + 0.5) screen:nil];
+                    NDLog(@"[perf] 显示器 DDC 音量不可用 → 退回系统音量 %d%%→%d%%", (int)(sc*100+0.5), (int)(st*100+0.5));
+                    return;
+                }
+                NDLog(@"[perf] 音量无基准值且系统音量读不到，跳过本次");
                 [self refreshAsync];
                 return;
             }
@@ -1442,22 +1634,22 @@ static const CGFloat kOSD_H = 44;
             break;
         }
         case ActHiDPI:
-            if (mainID) RunCLIAsync(@[@"hidpi", mainID, @"toggle"], ^(NSString *o) { [self refreshAsync]; });
+            if (mainID) RunCLIAsync(@[@"hidpi", mainID, @"toggle"], ^(NSString *o) { [self refreshNow]; });
             break;
         case ActMain:
-            if (secID) RunCLIAsync(@[@"main", secID], ^(NSString *o) { [self refreshAsync]; });
+            if (secID) RunCLIAsync(@[@"main", secID], ^(NSString *o) { [self refreshNow]; });
             break;
         case ActConnect: {
             if (!secID) return;
             DlDisp *s = [self secondaryDisp];
             BOOL active = s ? s.isActive : NO;
-            RunCLIAsync(@[active ? @"disable" : @"enable", secID], ^(NSString *o) { [self refreshAsync]; });
+            RunCLIAsync(@[active ? @"disable" : @"enable", secID], ^(NSString *o) { [self refreshNow]; });
             break;
         }
         case ActMode1:
         case ActMode2:
             if (mainID)
-                RunCLIAsync(@[@"mode", mainID, gConf[act == ActMode1 ? @"mode1Spec" : @"mode2Spec"]], ^(NSString *o) { [self refreshAsync]; });
+                RunCLIAsync(@[@"mode", mainID, gConf[act == ActMode1 ? @"mode1Spec" : @"mode2Spec"]], ^(NSString *o) { [self refreshNow]; });
             break;
         default:
             break;
@@ -1467,17 +1659,27 @@ static const CGFloat kOSD_H = 44;
 #pragma mark - 菜单
 
 // 版本号（与 Info.plist 的 CFBundleShortVersionString 保持一致）
-#define APP_VERSION   @"1.2"
+#define APP_VERSION   @"1.3.2"
 #define APP_AUTHOR    @"@yangc8899"
 
 - (void)menuWillOpen:(NSMenu *)menu { self.menuIsOpen = YES; }
 - (void)menuDidClose:(NSMenu *)menu { self.menuIsOpen = NO; }
 
 - (void)menuNeedsUpdate:(NSMenu *)menu {
+    // 【防重入】构建过程中若又被触发一次（例如异步刷新回来引起），removeAllItems 会打断上一次构建，
+    // 结果就是"某块显示器只剩内容、没有标题行"这种残缺菜单 —— 这里直接挡掉重入。
+    if (self.menuBuilding) return;
+    self.menuBuilding = YES;
+    [self buildMenu:menu];
+    self.menuBuilding = NO;
+}
+
+// 实际构建菜单内容（由 menuNeedsUpdate 调用）
+- (void)buildMenu:(NSMenu *)menu {
     // 【打开加速】不再每次同步刷新（info 要跑多次 DDC 读取，华为屏很慢，菜单会卡 1~3 秒）。
     // 首次或缓存超过 6 秒才同步刷一次，其余情况直接用缓存渲染、后台异步刷新供下次使用。
     NSTimeInterval age = self.lastRefresh ? -[self.lastRefresh timeIntervalSinceNow] : 999;
-    if (self.displays.count == 0 || age > 6.0) [self refreshNow];
+    if (self.displays.count == 0 || age > 1.5) [self refreshNow];   // 阈值收紧：状态变更后菜单要立即反映
     else [self refreshAsync];
     [menu removeAllItems];
 
@@ -1508,7 +1710,12 @@ static const CGFloat kOSD_H = 44;
         // 已关闭（断开）的屏不在"活动"区渲染：只保留下面 disabledIDs 段的一行标题+开关
         // —— 用户要求"关闭后配置收起，重新打开才展开"
         if (!d.isActive) continue;
-        [menu addItem:[self headerSwitchItemFor:d]];
+        {
+            NSString *sm = [d summary];
+            if (d.isMain) sm = [sm stringByAppendingString:@" · 主屏"];
+            [menu addItem:[self headerSwitchItemForID:[NSString stringWithFormat:@"%d", d.did]
+                                                 name:[d displayName] summary:sm active:YES]];
+        }
         if ([gConf[@"showBrightness"] boolValue]) [menu addItem:[self sliderItem:d vcp:0x10 title:@"亮度" value:d.bright max:d.bmax]];
         if ([gConf[@"showVolume"] boolValue])     [menu addItem:[self sliderItem:d vcp:0x62 title:@"音量" value:d.vol max:d.vmax]];
         if ([gConf[@"showResolution"] boolValue]) {
@@ -1544,9 +1751,9 @@ static const CGFloat kOSD_H = 44;
     }
 
     for (NSString *sid in self.disabledIDs) {
-        // 灰色标题行 + 关闭状态的开关：点开关即恢复连接
-        NSString *nm = self.dispNameCache[sid] ?: [NSString stringWithFormat:@"显示器 %@", sid];
-        [menu addItem:[self headerSwitchItemForID:sid name:nm summary:@"已关闭" active:NO]];
+        NSString *nm = self.dispNameByUUID[sid] ?: self.dispNameCache[sid]
+                       ?: [NSString stringWithFormat:@"显示器 %.8s", sid.UTF8String];
+        [menu addItem:[self headerSwitchItemForID:sid name:nm summary:@"已关闭（拨动右侧开关可连回）" active:NO]];
         [menu addItem:[NSMenuItem separatorItem]];
     }
 
@@ -1561,14 +1768,39 @@ static const CGFloat kOSD_H = 44;
     NSMenuItem *quitIt = [self plainItem:@"退出" action:@selector(onQuit:)];
     quitIt.image = [self symImage:@"power"];
     [menu addItem:quitIt];
+
+    // 【现场诊断】把真实菜单结构写文件（只在"运行时"才出现的渲染怪问题，靠它定位）
+    {
+        NSMutableString *dbg = [NSMutableString string];
+        [dbg appendFormat:@"displays=%lu disabled=%lu\n", (unsigned long)self.displays.count,
+                          (unsigned long)self.disabledIDs.count];
+        for (DlDisp *x in self.displays)
+            [dbg appendFormat:@"  disp id=%d active=%d name='%@' summary='%@'\n",
+                              x.did, x.isActive, [x displayName], [x summary]];
+        for (NSMenuItem *it in menu.itemArray) {
+            [dbg appendFormat:@"item '%@' view=%@ subviews=%lu\n", it.title,
+                              it.view ? @"Y" : @"N", (unsigned long)it.view.subviews.count];
+            for (NSView *sv in it.view.subviews)
+                [dbg appendFormat:@"   %@ frame=%@ text='%@'\n", NSStringFromClass([sv class]),
+                                  NSStringFromRect(sv.frame),
+                                  [sv isKindOfClass:[NSTextField class]] ? [(NSTextField *)sv stringValue] : @""];
+        }
+        [dbg writeToFile:@"/tmp/nd_menu.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
 }
 
-- (NSMenuItem *)headerItemFor:(DlDisp *)d {
-    NSString *t = [NSString stringWithFormat:@"%@    %@%@",
-                   [d displayName], [d summary], d.isMain ? @"   主屏" : @""];
-    NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:t action:nil keyEquivalent:@""];
-    it.enabled = NO;
-    return it;
+// 自定义菜单视图里的文字/图标必须**显式按当前系统外观取色**：
+// 动态色（labelColor 等）是按视图自身的 appearance 解析的，而这里是自己 new 出来的视图，
+// 默认 appearance 可能是浅色 → 在深色菜单里就变成"黑字画在黑底上"→ 整块标题行看起来消失了。
+- (BOOL)darkUI {
+    NSAppearanceName n = [[NSApp effectiveAppearance]
+        bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+    return [n isEqualToString:NSAppearanceNameDarkAqua];
+}
+
+- (NSColor *)uiPrimary { return [self darkUI] ? [NSColor whiteColor] : [NSColor blackColor]; }
+- (NSColor *)uiSecondary {
+    return [self darkUI] ? [NSColor colorWithWhite:1.0 alpha:0.62] : [NSColor colorWithWhite:0.0 alpha:0.55];
 }
 
 - (NSMenuItem *)plainItem:(NSString *)title action:(SEL)sel {
@@ -1603,7 +1835,21 @@ static const CGFloat kOSD_H = 44;
 }
 
 // 显示器标题行：图标 + 名字(加粗) + 摘要(小灰字) + 右侧开关 —— BetterDisplay 风格
+// 显示器标题行 + 连接开关 —— 用**系统标准菜单项**渲染
+// （原来用自定义 NSView + NSSwitch，实测在菜单里会出现"整行不可见"的渲染问题，
+//   改用系统渲染后标题/图标/勾选一定正常。）
+- (void)onNoop:(id)sender { }
+
+// 显示器行：**显示器名 + 摘要 + 连接状态合并成一项**（系统勾选行渲染，颜色一定正常）
+// 勾 = 已连接，点击即断开/连回。不再使用"名字行 + 摘要副标题"那种写法——
+// macOS 会把不带点击动作的项一律渲染成灰色，绕不过去。
+// 显示器标题行：图标 + 名字（加粗）+ 摘要（小字）+ **右侧拨杆开关** —— BetterDisplay 风格
+// 着色一律显式指定（按系统外观），不依赖动态色，避免在深色菜单里被算成黑字而看不见。
 - (NSMenuItem *)headerSwitchItemForID:(NSString *)did name:(NSString *)name summary:(NSString *)sum active:(BOOL)active {
+    // 防御：名字/摘要为空时用占位文本，绝不把 nil 塞给 NSTextField；任何异常都退回系统纯文本行。
+    NSString *nmSafe = name.length ? name : [NSString stringWithFormat:@"显示器 %@", did];
+    NSString *sumSafe = sum.length ? sum : @"";
+    @try {
     NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
     NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 46)];   // 标题行加高，和下方滑块拉开距离
 
@@ -1613,14 +1859,14 @@ static const CGFloat kOSD_H = 44;
     if (ic.image) [box addSubview:ic];
 
     NSTextField *lab = [[NSTextField alloc] initWithFrame:NSMakeRect(34, 21, 208, 18)];
-    lab.stringValue = name;
+    lab.stringValue = nmSafe;
     lab.bezeled = NO; lab.editable = NO; lab.drawsBackground = NO;
     lab.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
     if (!active) lab.textColor = [NSColor secondaryLabelColor];
     [box addSubview:lab];
 
     NSTextField *sub = [[NSTextField alloc] initWithFrame:NSMakeRect(34, 6, 208, 15)];
-    sub.stringValue = sum;
+    sub.stringValue = sumSafe;
     sub.bezeled = NO; sub.editable = NO; sub.drawsBackground = NO;
     sub.font = [NSFont systemFontOfSize:10];
     sub.textColor = [NSColor secondaryLabelColor];
@@ -1634,24 +1880,86 @@ static const CGFloat kOSD_H = 44;
 
     it.view = box;
     return it;
+    } @catch (NSException *e) {
+        NDLog(@"[menu] 标题行构建异常: %@ — 退回纯文本行", e.reason);
+        NSMenuItem *fb = [[NSMenuItem alloc] initWithTitle:nmSafe action:nil keyEquivalent:@""];
+        fb.image = [self symImage:active ? @"display" : @"rectangle.dashed"];
+        return fb;
+    }
 }
 
-- (NSMenuItem *)headerSwitchItemFor:(DlDisp *)d {
-    NSString *sub = [NSString stringWithFormat:@"%@%@", [d summary], d.isMain ? @"  · 主屏" : @""];
-    return [self headerSwitchItemForID:[NSString stringWithFormat:@"%d", d.did]
-                                   name:[d displayName]
-                                summary:sub
-                                 active:YES];
+- (NSMenuItem *)displayRowFor:(DlDisp *)d {
+    NSString *name = [d displayName];
+    if (d.isMain) name = [name stringByAppendingString:@"（主屏）"];
+    NSString *title = [NSString stringWithFormat:@"%@  %@", name, [d summary]];
+    NSMenuItem *it = [self checkItem:title on:YES
+                              action:@selector(onToggleConnectMenu:)
+                                 obj:[NSString stringWithFormat:@"%d", d.did]];
+    it.image = [self symImage:@"display"];
+    return it;
+}   // 空动作：只为让系统用正常文字色渲染标题行
+
+// 标题行文本：显示器名（正常色、加粗）+ 摘要（次要色、小字），用 attributed 强制指定颜色，
+// 不依赖系统对"无动作菜单项"的灰色渲染。
+- (NSAttributedString *)headerTextForName:(NSString *)name info:(NSString *)info {
+    NSMutableAttributedString *as = [[NSMutableAttributedString alloc] init];
+    if (name.length) {
+        [as appendAttributedString:[[NSAttributedString alloc] initWithString:name
+            attributes:@{NSForegroundColorAttributeName: [self uiPrimary],
+                         NSFontAttributeName: [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]}]];
+    }
+    if (info.length) {
+        [as appendAttributedString:[[NSAttributedString alloc] initWithString:
+            (name.length ? [@"  " stringByAppendingString:info] : info)
+            attributes:@{NSForegroundColorAttributeName: [self uiSecondary],
+                         NSFontAttributeName: [NSFont systemFontOfSize:11]}]];
+    }
+    return as;
 }
+
+- (NSMenuItem *)headerItemFor:(DlDisp *)d {
+    NSString *title = [d displayName];
+    if (d.isMain) title = [title stringByAppendingString:@"（主屏）"];
+    NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:title action:@selector(onNoop:) keyEquivalent:@""];
+    it.target = self;                 // 有 target/action 才不会被系统按"灰色信息行"渲染
+    it.image = [self symImage:@"display"];
+    it.attributedTitle = [self headerTextForName:title info:[d summary]];   // 显式颜色，双保险
+    return it;
+}
+
+// 连接开关：勾 = 已连接，点击切换（关 = 熄屏断开）
+- (NSMenuItem *)connectItemFor:(NSString *)did active:(BOOL)active {
+    NSMenuItem *it = [self checkItem:(active ? @"已连接" : @"已断开") on:active
+                              action:@selector(onToggleConnectMenu:) obj:did];
+    it.image = [self symImage:active ? @"checkmark.circle" : @"circle.slash"];
+    return it;
+}
+
+- (void)onToggleConnectMenu:(NSMenuItem *)it {
+    NSString *did = [it.representedObject stringValue];
+    BOOL nowOn = (it.state == NSControlStateValueOn);
+    [self.statusItem.menu cancelTracking];   // 同上：先收起菜单再改显示器配置
+    RunCLIAsync(@[nowOn ? @"disable" : @"enable", did], ^(NSString *o) {
+        if ([o rangeOfString:@"拒绝"].location != NSNotFound)
+            [self alert:@"不能断开最后一块显示器" text:@"系统要求至少保留一块活动显示器，操作已取消。"];
+        [self refreshNow];
+    });
+}
+
 
 // 标题行的开关：开 = 连接，关 = 熄屏断开
 - (void)onSwitchConnect:(NSSwitch *)sw {
     NSString *did = sw.identifier ?: [NSString stringWithFormat:@"%ld", (long)sw.tag];
     BOOL wantOn = (sw.state == NSControlStateValueOn);
+
+    // 【关键】先收起菜单再操作显示器。
+    // 关闭/开启显示器会让系统重排菜单栏，如果菜单还开着，整个菜单会被挪位置（用户看到"菜单上移、
+    // 第一行被挤出屏幕、看不到显示器名称"）。收起来操作就完全没有这个问题。
+    [self.statusItem.menu cancelTracking];
     RunCLIAsync(@[wantOn ? @"enable" : @"disable", did], ^(NSString *o) {
         if ([o rangeOfString:@"拒绝"].location != NSNotFound)
             [self alert:@"不能断开最后一块显示器" text:@"系统要求至少保留一块活动显示器，操作已取消。"];
-        [self refreshAsync];
+        [self refreshNow];   // 同步刷新：保证下次打开菜单就是最新状态
     });
 }
 
@@ -1818,7 +2126,7 @@ static const CGFloat kOSD_H = 44;
         return;
     }
     NDLog(@"[mode] 切换 id=%d HiDPI=%d → %@", did, wantHiDPI, spec);
-    RunCLIAsync(@[@"mode", [NSString stringWithFormat:@"%d", did], spec], ^(NSString *o) { [self refreshAsync]; });
+    RunCLIAsync(@[@"mode", [NSString stringWithFormat:@"%d", did], spec], ^(NSString *o) { [self refreshNow]; });
 }
 
 // 切换刷新率：保持当前分辨率与 HiDPI 组合，只改刷新率
@@ -1832,11 +2140,11 @@ static const CGFloat kOSD_H = 44;
     NSString *spec = [NSString stringWithFormat:@"%dx%d@%@:%@",
                       d.modeW, d.modeH, hz, d.modeHiDPI ? @"hidpi" : @"lodpi"];
     NDLog(@"[rate] 切换 id=%@ → %@", did, spec);
-    RunCLIAsync(@[@"mode", did, spec], ^(NSString *o) { [self refreshAsync]; });
+    RunCLIAsync(@[@"mode", did, spec], ^(NSString *o) { [self refreshNow]; });
 }
 
 - (void)onSetMain:(NSMenuItem *)it {
-    RunCLIAsync(@[@"main", [it.representedObject stringValue]], ^(NSString *o) { [self refreshAsync]; });
+    RunCLIAsync(@[@"main", [it.representedObject stringValue]], ^(NSString *o) { [self refreshNow]; });
 }
 
 // 屏幕旋转：直达系统设置 → 显示器，并尝试用辅助功能接口自动选中目标屏的缩略图
@@ -1913,7 +2221,7 @@ static const CGFloat kOSD_H = 44;
     NSString *did = [a[0] stringValue];
     NSString *side = a[1];   // @"right" 主屏在左 / @"left" 主屏在右
     RunCLIAsync(@[@"arrange", did, side], ^(NSString *o) {
-        [self refreshAsync];
+        [self refreshNow];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self alert:@"显示器排序" text:o.length ? o : @"已重排"];
         });
@@ -1926,7 +2234,7 @@ static const CGFloat kOSD_H = 44;
     NSString *did = [a[0] stringValue];
     NSString *deg = [a[1] stringValue];
     RunCLIAsync(@[@"rotate", did, deg], ^(NSString *o) {
-        [self refreshAsync];
+        [self refreshNow];
         dispatch_async(dispatch_get_main_queue(), ^{
             if ([o rangeOfString:@"无法"].location != NSNotFound ||
                 [o rangeOfString:@"失败"].location != NSNotFound) {
@@ -1950,7 +2258,7 @@ static const CGFloat kOSD_H = 44;
     RunCLIAsync(@[active ? @"disable" : @"enable", did], ^(NSString *o) {
         if ([o rangeOfString:@"拒绝"].location != NSNotFound)
             [self alert:@"不能断开最后一块显示器" text:@"系统要求至少保留一块活动显示器，操作已取消。"];
-        [self refreshAsync];
+        [self refreshNow];   // 同步刷新：保证下次打开菜单就是最新状态
     });
 }
 
@@ -1960,17 +2268,17 @@ static const CGFloat kOSD_H = 44;
     RunCLIAsync(@[@"disable", did], ^(NSString *o) {
         if ([o rangeOfString:@"拒绝"].location != NSNotFound)
             [self alert:@"不能关闭这块显示器" text:@"系统要求至少保留一块活动显示器，操作已取消。"];
-        [self refreshAsync];
+        [self refreshNow];
     });
 }
 
 - (void)onEnableID:(NSMenuItem *)it {
-    RunCLIAsync(@[@"enable", [it.representedObject description]], ^(NSString *o) { [self refreshAsync]; });
+    RunCLIAsync(@[@"enable", [it.representedObject description]], ^(NSString *o) { [self refreshNow]; });
 }
 
 - (void)onPickMode:(NSMenuItem *)it {
     NSArray *a = it.representedObject;
-    RunCLIAsync(@[@"mode", a[0], a[1]], ^(NSString *o) { [self refreshAsync]; });
+    RunCLIAsync(@[@"mode", a[0], a[1]], ^(NSString *o) { [self refreshNow]; });
 }
 
 - (void)onLayoutSave:(id)sender {

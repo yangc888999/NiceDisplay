@@ -8,11 +8,14 @@ A tiny macOS menu-bar utility for controlling external displays over DDC/CI — 
 resolution/HiDPI, main-display switching — plus real support for the Magic Keyboard's
 brightness keys on external monitors.
 
+![NiceDisplay 菜单截图](docs/screenshot-menu.png)
+
 ---
 
 ## 功能特性
 
 - **亮度 / 音量调节**：走显示器 DDC/CI 通道，用妙控键盘 `F1/F2`（亮度）、`F10/F11/F12`（静音 / 音量）直接调，长按连续调节
+- **音量键智能分流**：当前音频输出是显示器时走 DDC 调显示器音量；是蓝牙耳机 / 音箱 / 内置扬声器时自动改为调系统音量（同样有音量条 OSD），耳机和显示器来回切换无需改任何设置
 - **亮度跟随鼠标所在屏**：鼠标在哪块屏，亮度键就调哪块（可在设置里关闭，改为只调主屏）
 - **右上角长条 OSD**：仿系统原生样式的细长进度提示，只有进度条变化、不闪烁
 - **每块显示器一行管理**：标题行 + 右侧开关（开 = 连接，关 = 熄屏断开）
@@ -27,7 +30,7 @@ brightness keys on external monitors.
 
 ## 直接下载（不想自己编译）
 
-预编译安装包就在这个仓库里：**[dist/NiceDisplay-1.2.dmg](dist/NiceDisplay-1.2.dmg)**（历史版本见 `dist/` 目录）
+预编译安装包就在这个仓库里：**[dist/NiceDisplay-1.3.2.dmg](dist/NiceDisplay-1.3.2.dmg)**（历史版本见 `dist/` 目录）
 
 下载后打开 dmg，把 `NiceDisplay.app` 拖进「应用程序」即可。
 
@@ -139,7 +142,8 @@ $DLITE layout save|restore|show   # 布局快照
 - **能力全部动态探测**，不含任何针对特定型号的硬编码：
   - 分辨率档位：常用档位表 + 按显示器自身宽高比动态兜底（超宽屏 / 5K / 竖屏旋转都适配）
   - 刷新率：从该屏实际的模式列表中按"当前分辨率 + HiDPI 组合"筛选
-  - 音量键作用屏：按当前音频输出设备名匹配；匹配不到退回主屏
+  - 音量输出判定：按默认音频输出设备的传输类型（DisplayPort/HDMI = 显示器 → DDC；
+    蓝牙 / USB / 内置等 → CoreAudio 直写系统主音量；显示器 DDC 音量不可用时也自动兜底到系统音量）
   - 亮度跟随鼠标：按 `NSScreen` 命中位置映射显示器
   - DDC / 旋转能力：运行时探测（私有接口未导出时自动降级并提示）
 - **回调必须立刻返回**：tap 回调里禁止建窗口 / 跑动画 / 做文件 I/O，

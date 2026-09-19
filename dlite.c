@@ -312,6 +312,9 @@ static void fill_info(CGDirectDisplayID did, DispInfo *out) {
 // 按 ID 或 UUID 找显示器。
 // 注意：纯数字一律按 CGDirectDisplayID 解释——断开后的屏会从在线列表消失，但 ID 仍然可用；
 // 若让数字fall through 到 UUID 前缀匹配，短数字会误撞别的屏 UUID（曾因此操作错屏）。
+#define ST_MAX 32
+static int state_load(char list[ST_MAX][64]);   // 前置声明（下面 resolve_target 的兜底要用）
+
 static int resolve_target(const char *arg, CGDirectDisplayID *out) {
     if (!arg || !*arg) return -1;
     int all_digits = 1;
@@ -326,6 +329,29 @@ static int resolve_target(const char *arg, CGDirectDisplayID *out) {
         DispInfo di; fill_info(online[i], &di);
         if (di.uuid[0] && !strncasecmp(di.uuid, arg, strlen(arg))) { *out = online[i]; return 0; }
     }
+    // 【兜底】已关闭/离线的显示器不在"在线列表"里 —— 用关闭时记录下来的 display id 还原。
+    // 这是"菜单里点一下就能把关闭的屏连回来"能生效的关键。
+    // 注意：必须直接读记录文件（state_load 只返回 uuid 列，拿不到附加的 id）。
+    {
+        const char *h = getenv("HOME");
+        char sp[512];
+        snprintf(sp, sizeof sp, "%s/.dlite-disabled", h ? h : "/tmp");
+        FILE *f = fopen(sp, "r");
+        if (f) {
+            char line[200];
+            while (fgets(line, sizeof line, f)) {
+                char u[64] = {0}, nm[64] = {0}; unsigned didv = 0;
+                if (sscanf(line, "%63s\t%63s\t%u", u, nm, &didv) >= 3 && didv) {
+                    if (!strncasecmp(u, arg, strlen(arg))) {
+                        fclose(f);
+                        *out = (CGDirectDisplayID)didv;
+                        return 0;
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
     return -1;
 }
 
@@ -336,35 +362,71 @@ static const char *state_path(void) {
     snprintf(p, sizeof p, "%s/.dlite-disabled", h ? h : "/tmp");
     return p;
 }
-static int state_load(CGDirectDisplayID *ids, int max) {
+// 已关闭显示器的记录：**存 UUID 而不是 display id**。
+// 原因：显示器断开/重连后 macOS 会重新分配 display id（实测 1/2/3 来回变），
+// 用 id 记录会导致"连不回来"、也查不到显示器名字。UUID 是稳定的。
+static void display_uuid_str(CGDirectDisplayID did, char *out, size_t n) {
+    out[0] = 0;
+    CFDictionaryRef info = p_CDInfo ? p_CDInfo(did) : NULL;     // 与 dlite info 同一取法
+    if (info) {
+        CFTypeRef u = CFDictionaryGetValue(info, CFSTR("kCGDisplayUUID"));
+        if (u && CFGetTypeID(u) == CFStringGetTypeID())
+            CFStringGetCString(u, out, (CFIndex)n, kCFStringEncodingUTF8);
+    }
+    if (!out[0]) snprintf(out, n, "unknown-%u", (unsigned)did);
+}
+static int state_load(char list[ST_MAX][64]) {
     FILE *f = fopen(state_path(), "r");
     if (!f) return 0;
-    int n = 0; unsigned v;
-    while (n < max && fscanf(f, "%u", &v) == 1) {
+    int n = 0; char line[160];
+    while (n < ST_MAX && fgets(line, sizeof line, f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t L = strlen(p);
+        while (L && (p[L-1] == '\n' || p[L-1] == '\r' || p[L-1] == ' ')) p[--L] = 0;
+        if (!L) continue;
+        // 保留完整行（uuid<TAB>名字<TAB>关闭时的id）；去重按第一列 uuid
+        char u[64] = {0};
+        if (sscanf(p, "%63s", u) != 1) continue;
         int dup = 0;
-        for (int i = 0; i < n; i++) if (ids[i] == (CGDirectDisplayID)v) dup = 1;
-        if (!dup) ids[n++] = (CGDirectDisplayID)v;
+        for (int i = 0; i < n; i++) {
+            char eu[64] = {0};
+            sscanf(list[i], "%63s", eu);
+            if (!strcmp(eu, u)) { dup = 1; break; }
+        }
+        if (!dup) snprintf(list[n++], 64, "%s", p);
     }
     fclose(f);
     return n;
 }
-static void state_save(CGDirectDisplayID *ids, int n) {
+static void state_save(char list[ST_MAX][64], int n) {
     FILE *f = fopen(state_path(), "w");
     if (!f) return;
-    for (int i = 0; i < n; i++) fprintf(f, "%u\n", ids[i]);
+    for (int i = 0; i < n; i++) fprintf(f, "%s\n", list[i]);   // 每行: uuid[<TAB>名字]
     fclose(f);
 }
-static void state_add(CGDirectDisplayID did) {
-    CGDirectDisplayID ids[32]; int n = state_load(ids, 32);
-    for (int i = 0; i < n; i++) if (ids[i] == did) return;
-    if (n < 32) ids[n++] = did;
-    state_save(ids, n);
+// 注意：调用方要在**关闭显示器之前**先取好 UUID —— 关闭后 did 可能已失效、取不到。
+static void state_add_uuid_name(const char *uuid, const char *name, unsigned didv) {
+    if (!uuid || !uuid[0]) return;
+    char list[ST_MAX][64]; int n = state_load(list), m = 0;
+    for (int i = 0; i < n; i++) {          // 剔除同 uuid 的旧条目（要刷新成带名字/编号的）
+        char eu[64] = {0};
+        sscanf(list[i], "%63s", eu);
+        if (strcmp(eu, uuid)) snprintf(list[m++], 64, "%s", list[i]);
+    }
+    if (m < ST_MAX)
+        snprintf(list[m++], 64, "%s\t%s\t%u", uuid, (name && name[0]) ? name : "", didv);
+    state_save(list, m);
 }
-static void state_remove(CGDirectDisplayID did) {
-    CGDirectDisplayID ids[32]; int n = state_load(ids, 32);
-    int m = 0;
-    for (int i = 0; i < n; i++) if (ids[i] != did) ids[m++] = ids[i];
-    state_save(ids, m);
+static void state_remove_uuid(const char *uuid) {
+    if (!uuid || !uuid[0]) return;
+    char list[ST_MAX][64]; int n = state_load(list), m = 0;
+    for (int i = 0; i < n; i++) {
+        char eu[64] = {0};
+        sscanf(list[i], "%63s", eu);
+        if (strcmp(eu, uuid)) snprintf(list[m++], 64, "%s", list[i]);
+    }
+    state_save(list, m);
 }
 
 static long parse_num(const char *s) { return strtol(s, NULL, 0); }
@@ -376,6 +438,11 @@ static uint32_t active_count(void) {
 }
 
 // 启用/禁用显示器：必须在显示器重配置事务里调用私有 CGSConfigureDisplayEnabled
+//
+// ⚠️ 关于"黑屏"：提交会话级配置后，系统会重新协商**所有**显示器的信号，
+// 于是关闭 A 屏时 B 屏也会黑一下——这是 macOS 的固有行为（BetterDisplay 等工具同样如此），
+// 实测 kCGConfigureForAppOnly 也**不能**避免（曾误以为可以避免，已回退）。
+// 另一条路（DDC 0xD6 待机）经实测会让显示器从在线列表消失、难以唤回，故不采用。
 static int set_display_enabled(CGDirectDisplayID did, int enable) {
     if (!p_CfgEnabled) { fprintf(stderr, "本机不提供 CGSConfigureDisplayEnabled\n"); return -1; }
     CGDisplayConfigRef cfg = NULL;
@@ -468,6 +535,9 @@ static CGDisplayModeRef find_mode(CGDirectDisplayID did, const ModeSpec *sp, int
     return found;
 }
 
+// 切换显示模式（分辨率 / 刷新率 / HiDPI）。
+// 切换时显示器需要重新同步信号，因此**被调整的屏幕必然短暂黑一下**（系统与硬件行为，无法避免）；
+// 实测 kCGConfigureForAppOnly 并不能消除（曾误以为可以，已回退），保留实现简洁、行为可预期。
 static int apply_mode(CGDirectDisplayID did, CGDisplayModeRef m) {
     CGDisplayConfigRef cfg = NULL;
     CGError e = CGBeginDisplayConfiguration(&cfg);
@@ -1241,12 +1311,18 @@ static void cmd_list(void) {
 static void cmd_restore(void) {
     int done = 0;
     // 1) 先恢复记录在案的已断开显示器——它们已从在线列表消失，只能靠记录找回
-    CGDirectDisplayID rec[32]; int rn = state_load(rec, 32);
+    char rec[ST_MAX][64]; int rn = state_load(rec);
     for (int i = 0; i < rn; i++) {
-        printf("连回记录中的 id=%u ... ", rec[i]);
+        char ru[64] = {0};
+        sscanf(rec[i], "%63s", ru);
+        CGDirectDisplayID rd;
+        if (resolve_target(ru, &rd) != 0) continue;
+        printf("连回记录中的 %s ... ", ru);
         fflush(stdout);
-        if (set_display_enabled(rec[i], 1) == 0) { printf("OK\n"); state_remove(rec[i]); done++; }
-        else printf("失败\n");
+        int ok = (set_display_enabled(rd, 1) == 0);
+        CFTypeRef svc0 = service_for_display(rd, NULL);
+        if (svc0) { ddc_set(svc0, 0xD6, 1); CFRelease(svc0); }   // 待机过的屏需补发开机指令
+        if (ok) { printf("OK\n"); state_remove_uuid(ru); done++; } else printf("失败\n");
     }
     // 2) 再扫在线列表里处于未启用状态的
     CGDirectDisplayID online[16]; uint32_t n = 0;
@@ -1257,6 +1333,31 @@ static void cmd_restore(void) {
             fflush(stdout);
             if (set_display_enabled(online[i], 1) == 0) { printf("OK\n"); done++; }
             else printf("失败\n");
+        }
+    }
+    // 3) 兜底：按布局快照里记录的 UUID 逐个找回
+    //    有些显示器（例如被 DDC 0xD6 待机、或异常断开过）会从在线列表里彻底消失，
+    //    此时**只有 UUID 还能解析出 display id**，而且必须补一条 DDC 开机指令(0xD6=01)才会真正点亮。
+    {
+        char lp[512];
+        const char *h = getenv("HOME");
+        snprintf(lp, sizeof lp, "%s/.dlite-layout", h ? h : "/tmp");
+        FILE *f = fopen(lp, "r");
+        if (f) {
+            char uuid[80]; int x, y, w, hh;
+            while (fscanf(f, "%79s %d %d %d %d", uuid, &x, &y, &w, &hh) == 5) {
+                CGDirectDisplayID did;
+                if (resolve_target(uuid, &did) != 0) continue;
+                if (CGDisplayIsActive(did)) continue;
+                printf("按快照 UUID 连回 id=%u (%s) ... ", did, uuid);
+                fflush(stdout);
+                int ok = (set_display_enabled(did, 1) == 0);
+                CFTypeRef svc = service_for_display(did, NULL);
+                if (svc) { ddc_set(svc, 0xD6, 1); CFRelease(svc); }   // 待机的屏要点亮必须发这条
+                printf("%s\n", ok ? "OK" : "失败");
+                if (ok) done++;
+            }
+            fclose(f);
         }
     }
     if (!done) printf("无需恢复（所有在线显示器均已启用）\n");
@@ -1599,7 +1700,7 @@ int main(int argc, char **argv) {
         CGDirectDisplayID did = (CGDirectDisplayID)parse_num(argv[2]);
         int secs = atoi(argv[3]);
         sleep((unsigned)secs);
-        if (set_display_enabled(did, 1) == 0) state_remove(did);
+        if (set_display_enabled(did, 1) == 0) { char u[64]; display_uuid_str(did, u, sizeof u); state_remove_uuid(u); }
         return 0;
     }
 
@@ -1620,9 +1721,35 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "list")) { cmd_list(); return 0; }
     if (!strcmp(argv[1], "info")) { cmd_info(); return 0; }
     if (!strcmp(argv[1], "disabled")) {
-        CGDirectDisplayID rec[32];
-        int rn = state_load(rec, 32);
-        for (int i = 0; i < rn; i++) printf("disabled id=%u\n", rec[i]);
+        // 【自愈】已经在线的显示器，其"已关闭"记录自动清理掉：
+        // 例如系统升级/系统自己恢复了显示器后，旧记录会残留，导致菜单里同一块屏出现两次。
+        CGDirectDisplayID on[16]; uint32_t onc = 0;
+        CGGetOnlineDisplayList(16, on, &onc);
+        char live[16][64]; int liveN = 0;
+        for (uint32_t i = 0; i < onc && liveN < 16; i++) {
+            DispInfo di; fill_info(on[i], &di);
+            if (di.uuid[0]) snprintf(live[liveN++], 64, "%s", di.uuid);
+        }
+        FILE *sf = fopen(state_path(), "r");
+        if (sf) {
+            char keep[ST_MAX][64]; int keepN = 0, total = 0;
+            char line[200];
+            while (fgets(line, sizeof line, sf)) {
+                size_t L = strlen(line);
+                while (L && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = 0;
+                if (!L) continue;
+                total++;
+                char u[64] = {0};
+                sscanf(line, "%63s", u);
+                int isLive = 0;
+                for (int i = 0; i < liveN; i++) if (!strcasecmp(u, live[i])) { isLive = 1; break; }
+                if (isLive) continue;                       // 已在线 → 记录作废，不输出
+                printf("disabled %s\n", line);               // uuid<TAB>名字<TAB>关闭时的id
+                if (keepN < ST_MAX) snprintf(keep[keepN++], 64, "%s", line);
+            }
+            fclose(sf);
+            if (keepN < total) state_save(keep, keepN);      // 有清理就写回（自愈）
+        }
         return 0;
     }
     if (!strcmp(argv[1], "presets")) {
@@ -1893,10 +2020,21 @@ int main(int argc, char **argv) {
 
         if (revert > 0 && !enable) spawn_revert(did, revert);
 
+        char uuidBefore[64] = {0};
+        display_uuid_str(did, uuidBefore, sizeof uuidBefore);   // 关闭前取 UUID（关闭后可能取不到）
+        if (strncmp(uuidBefore, "unknown-", 8) == 0 && strlen(argv[2]) > 8)
+            snprintf(uuidBefore, sizeof uuidBefore, "%s", argv[2]);   // 拿不到就用命令里传的 UUID
+        char nmBefore[128] = {0};
+        display_name(did, nmBefore, sizeof nmBefore);           // 名字同理，关闭前取
         int rc = set_display_enabled(did, enable);
         usleep(400000);
         if (rc == 0) {
-            if (enable) state_remove(did); else state_add(did);
+            if (enable) {
+                state_remove_uuid(uuidBefore);
+                if (strlen(argv[2]) > 8) state_remove_uuid(argv[2]);   // 双保险：命令里传的就是 UUID
+            } else {
+                state_add_uuid_name(uuidBefore, nmBefore, (unsigned)did);
+            }
             CGDirectDisplayID a[16]; uint32_t n = 0;
             CGGetActiveDisplayList(16, a, &n);
             int stillActive = 0;
