@@ -24,6 +24,7 @@
 #include <IOKit/IOKitLib.h>
 #include <IOKit/graphics/IOGraphicsLib.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 
 extern char **environ;
 
@@ -458,6 +459,117 @@ static int set_display_enabled(CGDirectDisplayID did, int enable) {
     e = CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
     if (e != kCGErrorSuccess) { fprintf(stderr, "CGCompleteDisplayConfiguration 失败 e=%d\n", (int)e); return -1; }
     return 0;
+}
+
+// ============================ macOS 版本 & 安全熄屏（27+ 兼容） ============================
+// macOS 27 起，私有 CGSConfigureDisplayEnabled 的会话级提交会触发全屏信号重协商，
+// 在 MateView / AOC 组合上会令显示驱动瞬崩（紫屏 = WindowServer 崩溃），并把主屏（左华为）掉没。
+// 故 27+ 上"断开/连接显示器"改走安全路径：仅用 DDC 把亮度归零/恢复（屏幕变黑但不掉屏、不紫屏、桌面不重排）。
+static int os_major_version(void) {
+    char buf[32] = {0};
+    size_t len = sizeof(buf) - 1;
+    if (sysctlbyname("kern.osproductversion", buf, &len, NULL, 0) != 0) return 0;
+    buf[sizeof(buf) - 1] = 0;
+    return atoi(buf);   // "27.2" -> 27
+}
+
+// 熄屏状态文件：每行 `uuid<TAB>熄屏前亮度<TAB>熄屏方式`
+//   熄屏方式 pwr2 = DDC 电源模式 0xD6=2：面板真灭但**链路不断**，系统里屏仍在线，软件可一键点亮 ★首选
+//            pwr4 = DDC 电源模式 0xD6=4：硬待机，显示器自己断链 → 只能按显示器电源键点亮
+//            dim  = DDC 亮度归零（兼容老记录）：屏变暗但仍可见，软件可点亮
+// 与 ~/.dlite-disabled（私有 API 真·断开，屏离线）严格区分开。
+static const char *safeoff_path(void) {
+    static char p[512];
+    const char *h = getenv("HOME");
+    snprintf(p, sizeof p, "%s/.dlite-safeoff", h ? h : "/tmp");
+    return p;
+}
+// 读一条记录（bright/kind 可传 NULL）。返回 1=命中，0=没有
+static int safeoff_load(const char *uuid, int *bright, char *kind, size_t kn) {
+    FILE *f = fopen(safeoff_path(), "r");
+    if (!f) return 0;
+    char line[200]; int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        char u[64] = {0}, k[16] = {0}; int b = 0;
+        int n = sscanf(line, "%63s\t%d\t%15s", u, &b, k);
+        if (n < 2 || strcasecmp(u, uuid)) continue;
+        if (bright) *bright = b;
+        if (kind && kn) snprintf(kind, kn, "%s", n >= 3 ? k : "dim");   // 老记录无方式 → dim
+        found = 1; break;
+    }
+    fclose(f);
+    return found;
+}
+static int safeoff_load_bright(const char *uuid) {
+    int b = -1;
+    return safeoff_load(uuid, &b, NULL, 0) ? b : -1;
+}
+static void safeoff_store(const char *uuid, int bright, const char *kind) {
+    // 已存在则保留原记录（不要被反复"熄屏"覆盖成 0 / 改方式，否则点亮恢复不回来）
+    if (safeoff_load(uuid, NULL, NULL, 0)) return;
+    FILE *f = fopen(safeoff_path(), "a");
+    if (f) { fprintf(f, "%s\t%d\t%s\n", uuid, bright, kind ? kind : "dim"); fclose(f); }
+}
+static void safeoff_remove(const char *uuid) {
+    FILE *f = fopen(safeoff_path(), "r");
+    if (!f) return;
+    char keep[64][128]; int n = 0; char line[200];
+    while (n < 64 && fgets(line, sizeof line, f)) {
+        char u[64] = {0};
+        if (sscanf(line, "%63s", u) != 1 || !strcasecmp(u, uuid)) continue;   // 跳过目标行
+        if (n < 64) snprintf(keep[n++], 128, "%s", line);
+    }
+    fclose(f);
+    FILE *o = fopen(safeoff_path(), "w");
+    if (o) { for (int i = 0; i < n; i++) fputs(keep[i], o); fclose(o); }
+}
+// 安全熄屏（macOS 27+ 的"关闭显示器"）：
+// 首选 VCP 0xD6=2 —— 实测 AOC：面板真灭（黑屏），但 **DP 链路不断**、系统里屏仍在线、DDC 双向可读；
+// 全程不调用私有 API、不提交显示会话 → 不触发 27.2 全屏重协商（紫屏），桌面不重排，
+// 且菜单里再点一次即可用 0xD6=1 点亮（不需要按显示器电源键）。
+// 备选 0xD6=4（硬待机：面板也灭，但显示器自己断链，只能按电源键点亮）；都不支持才退回亮度归零。
+static int safe_display_off(CGDirectDisplayID did) {
+    CFTypeRef svc = service_for_display(did, NULL);
+    if (!svc) { fprintf(stderr, "该显示器无 DDC 服务，无法熄屏\n"); return -1; }
+    uint16_t cur = 0, max = 0;
+    int prev = (ddc_get(svc, 0x10, &cur, &max) == 0 && cur > 0) ? (int)cur : 50;
+    char u[64] = {0}; display_uuid_str(did, u, sizeof u);
+    if (ddc_set(svc, 0xD6, 2) == 0) {              // ★首选：面板灭、链路在、可软件点亮
+        safeoff_store(u, prev, "pwr2");
+        CFRelease(svc);
+        usleep(700000);                            // 等电源模式状态落定，供自愈正确识别
+        return 0;
+    }
+    if (ddc_set(svc, 0xD6, 4) == 0) {              // 备选：硬待机（链路会断）
+        safeoff_store(u, prev, "pwr4");
+        CFRelease(svc);
+        usleep(1500000);
+        return 0;
+    }
+    int rc = ddc_set(svc, 0x10, 0);                // 兜底：亮度归零
+    if (rc == 0) safeoff_store(u, prev, "dim");
+    CFRelease(svc);
+    return rc == 0 ? 0 : -1;
+}
+// 安全点亮：把电源模式拉回 0xD6=1 并恢复熄屏前亮度，然后清记录。
+// 若屏处于硬待机（链路已断、DDC 不通）→ 只能请用户按显示器电源键。
+static int safe_display_on(CGDirectDisplayID did) {
+    char u[64] = {0}; display_uuid_str(did, u, sizeof u);
+    int prev = -1; char kind[16] = {0};
+    safeoff_load(u, &prev, kind, sizeof kind);
+    CFTypeRef svc = service_for_display(did, NULL);
+    if (!svc) {
+        printf("该显示器处于硬待机（链路已断），软件无法点亮：请按一下显示器电源键。\n");
+        return -2;
+    }
+    ddc_set(svc, 0xD6, 1);                         // 电源模式拉回 On
+    uint16_t c0 = 0, m0 = 0;
+    int v = prev;
+    if (v < 0) v = (ddc_get(svc, 0x10, &c0, &m0) == 0 && c0 > 0) ? (int)c0 : 50;
+    int rc = ddc_set(svc, 0x10, (uint16_t)v);      // 恢复熄屏前亮度（dim 方式必需）
+    if (rc == 0) safeoff_remove(u);
+    CFRelease(svc);
+    return rc == 0 ? 0 : -1;
 }
 
 // ============================ 显示模式 / 主屏 ============================
@@ -1360,6 +1472,24 @@ static void cmd_restore(void) {
             fclose(f);
         }
     }
+    // 3.5) macOS 27+ 安全熄屏的屏：直接恢复亮度（这类屏在线只是变黑，不走硬重连）
+    {
+        FILE *f = fopen(safeoff_path(), "r");
+        if (f) {
+            char ln[200];
+            while (fgets(ln, sizeof ln, f)) {
+                char u[64] = {0}; int b = 0;
+                if (sscanf(ln, "%63s\t%d", u, &b) != 2) continue;
+                CGDirectDisplayID rd;
+                if (resolve_target(u, &rd) == 0) {
+                    printf("点亮安全熄屏的 %s ... ", u);
+                    fflush(stdout);
+                    if (safe_display_on(rd) == 0) { printf("OK\n"); done++; } else printf("失败\n");
+                }
+            }
+            fclose(f);
+        }
+    }
     if (!done) printf("无需恢复（所有在线显示器均已启用）\n");
 }
 
@@ -1700,7 +1830,8 @@ int main(int argc, char **argv) {
         CGDirectDisplayID did = (CGDirectDisplayID)parse_num(argv[2]);
         int secs = atoi(argv[3]);
         sleep((unsigned)secs);
-        if (set_display_enabled(did, 1) == 0) { char u[64]; display_uuid_str(did, u, sizeof u); state_remove_uuid(u); }
+        int rc = (os_major_version() >= 27) ? safe_display_on(did) : set_display_enabled(did, 1);
+        if (rc == 0) { char u[64]; display_uuid_str(did, u, sizeof u); state_remove_uuid(u); }
         return 0;
     }
 
@@ -1749,6 +1880,50 @@ int main(int argc, char **argv) {
             }
             fclose(sf);
             if (keepN < total) state_save(keep, keepN);      // 有清理就写回（自愈）
+        }
+        // —— 熄屏（27+ 安全方式）也报出来，让菜单能反转点亮 ——
+        // 自愈规则（按记录里的"熄屏方式"判定）：
+        //   pwr2/pwr4（电源模式）：读 0xD6 —— 1=已被点亮→清理；其它值=仍关着→保留；读不到→保守保留
+        //   dim（亮度归零）      ：亮度 0=仍关着→保留；非 0→清理
+        //   屏离线（解析不到）   ：硬待机中→保留
+        {
+            FILE *sf2 = fopen(safeoff_path(), "r");
+            if (sf2) {
+                char keep2[64][128]; int kn = 0; char ln[200];
+                while (kn < 64 && fgets(ln, sizeof ln, sf2)) {
+                    char u[64] = {0}, k[16] = {0}; int b = 0;
+                    if (sscanf(ln, "%63s\t%d\t%15s", u, &b, k) < 2) continue;
+                    if (!k[0]) snprintf(k, sizeof k, "dim");        // 老记录（无方式）按 dim 处理
+                    CGDirectDisplayID sd = 0; int keepIt = 0;
+                    if (resolve_target(u, &sd) != 0) {
+                        keepIt = 1;                                  // 离线 = 硬待机中
+                    } else {
+                        CFTypeRef s2 = service_for_display(sd, NULL);
+                        if (!s2) keepIt = 1;
+                        else {
+                            uint16_t c = 0, m = 0;
+                            if (!strcmp(k, "dim")) {
+                                if (ddc_get(s2, 0x10, &c, &m) == 0) keepIt = (c == 0);
+                                else keepIt = 1;
+                            } else {
+                                if (ddc_get(s2, 0xD6, &c, &m) == 0) keepIt = (c != 1);
+                                else keepIt = 1;
+                            }
+                            CFRelease(s2);
+                        }
+                    }
+                    if (keepIt) {
+                        char nm[128] = {0};
+                        if (sd) display_name(sd, nm, sizeof nm);
+                        printf("softoff %s\t%s\t%u\n", u, nm[0] ? nm : "显示器", (unsigned)sd);
+                        if (kn < 64) snprintf(keep2[kn++], 128, "%s\t%d\t%s\n", u, b, k);
+                    }
+                    // 判定"已点亮"→ 丢弃该行（自愈）
+                }
+                fclose(sf2);
+                FILE *o2 = fopen(safeoff_path(), "w");
+                if (o2) { for (int i = 0; i < kn; i++) fputs(keep2[i], o2); fclose(o2); }
+            }
         }
         return 0;
     }
@@ -1999,9 +2174,33 @@ int main(int argc, char **argv) {
 
     if (!strcmp(argv[1], "disable") || !strcmp(argv[1], "enable")) {
         if (argc < 3) { fprintf(stderr, "缺少目标显示器\n"); return 2; }
-        CGDirectDisplayID did;
-        if (resolve_target(argv[2], &did) != 0) { fprintf(stderr, "找不到显示器 %s\n", argv[2]); return 1; }
         int enable = !strcmp(argv[1], "enable");
+        CGDirectDisplayID did;
+        if (resolve_target(argv[2], &did) != 0) {
+            // enable 时找不到目标：说明屏处于硬待机（0xD6=4，链路已断），只能请用户按电源键
+            if (enable && os_major_version() >= 27 && safeoff_load_bright(argv[2]) >= 0) {
+                printf("该显示器处于硬待机（链路已断），软件无法点亮：请按一下显示器电源键。\n");
+                return 0;
+            }
+            fprintf(stderr, "找不到显示器 %s\n", argv[2]); return 1;
+        }
+
+        // —— macOS 27+ 安全路径：绝不调用私有 CGSConfigureDisplayEnabled（会触发全屏重协商→紫屏+掉屏）——
+        if (os_major_version() >= 27) {
+            if (enable) {
+                int rc = safe_display_on(did);
+                if (rc == -2) return 4;   // 硬待机离线：消息已打印，引导用户按显示器电源键
+                printf("%s（已点亮：恢复熄屏前亮度）\n", rc == 0 ? "OK" : "失败");
+                return rc == 0 ? 0 : 1;
+            } else {
+                // 与 <27 路径同样的安全闸：不能关掉最后一块屏
+                uint32_t ac = active_count();
+                if (ac <= 1) { fprintf(stderr, "拒绝：当前只有 %u 块活动显示器，断开后将无屏可用\n", ac); return 3; }
+                int rc = safe_display_off(did);
+                printf("%s（已关闭：面板熄灭、显示器保持连接，再点一次开关即可点亮）\n", rc == 0 ? "OK" : "失败");
+                return rc == 0 ? 0 : 1;
+            }
+        }
 
         if (!enable) {
             // 安全闸：绝不能把最后一块活动屏断开，否则用户将失去操作界面

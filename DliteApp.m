@@ -6,6 +6,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreFoundation/CFMachPort.h>
 #import <ApplicationServices/ApplicationServices.h>
+#include <dlfcn.h>          // HDR 开关要走 CoreDisplay 私有接口（运行时 dlsym）
 
 @class OSDBar;
 @class DlDisp;
@@ -273,7 +274,396 @@ enum {
 };
 #define NX_SUBTYPE_AUX_CONTROL_BUTTONS 8
 
-// 当前默认音频输出设备的名称（用来判断"音量键该调哪块屏"）
+// ============================ HDR 探测 & 软件调暗 ============================
+// 【根因】显示器开启"高动态范围"(HDR) 后，会按像素在内部管理亮度，**多数显示器直接停止接受
+// DDC/CI 亮度命令**（VCP 0x10）。实测：QSN-CBB 开 HDR 后写 0x10=45，回读立刻仍是 100 ——
+// 写入被显示器丢弃。同样的写入在未开 HDR 的 AOC 上正常保持。
+// 业界共识（BetterDisplay 官方文档亦如此）：HDR 模式下第三方屏的 DDC 亮度不可靠，
+// 主流做法是改用**软件调暗**。故：HDR 屏走软件调暗，关掉 HDR 自动切回 DDC 真亮度。
+//
+// HDR 判定用公开 API NSScreen.maxExtendedDynamicRangeColorComponentValue：
+//   > 1.0 表示该屏支持/已进入扩展动态范围（实测 HDR 开的屏 = 1.2，未开的 = 1.0）。
+
+// 该屏是否处于 HDR / 扩展动态范围状态
+static BOOL DisplayIsEDR(CGDirectDisplayID did) {
+    for (NSScreen *s in [NSScreen screens]) {
+        NSNumber *n = s.deviceDescription[@"NSScreenNumber"];
+        if (!n || (int)n.unsignedIntValue != (int)did) continue;
+        // 私有 KVC：公开头文件里没有该属性，但 AppKit 运行时确实提供
+        @try {
+            double v = [[s valueForKey:@"maximumExtendedDynamicRangeColorComponentValue"] doubleValue];
+            if (v > 1.02) return YES;
+        } @catch (NSException *e) { /* 该系统没这个属性 → 视为非 HDR */ }
+        return NO;
+    }
+    return NO;
+}
+
+// —— 软件调暗：给指定屏幕挂一个黑色叠加层，用"压暗程度"模拟亮度 ——
+// 这是 HDR 下唯一能让画面变暗、又不碰显示器背光的方式（与 BetterDisplay"叠加调暗"同思路）。
+// 同一块屏只保留一个 overlay：重复调用只改不透明度，不叠加。
+//
+// ⚠️⚠️ 语义坑（曾把用户屏幕搞成全黑）：这里存的是**亮度**（0~100，100=最亮），
+// 而叠加层要的是**黑度**，两者是**反向**的：
+//     黑度 = (1 - 亮度/100) × 0.9
+// 一开始直接把"亮度值"当黑度用（亮度 90 → 盖 90% 黑），结果一按亮度键屏幕就全黑了。
+// 另加 MAX=0.9 上限：即使亮度调到 0 也保留一点点可见度，避免用户把自己"调瞎"没法恢复。
+#define ND_SW_DIM_MAX 0.9
+static void NDLog(NSString *fmt, ...);      // 前置声明（定义在文件后部）
+
+// ⚠️ 状态一律按**显示器 UUID** 存，不能按 CGDirectDisplayID：
+// 实测这台机器的显示器 ID 会漂移（QSN-CBB 曾 2→1、AOC 曾 1→3）。按 ID 存会出现
+// "旧遮罩窗口残留、新 ID 查不到亮度值" → 屏幕仍被压暗但滑条显示 100%（看起来就是"乱跳"）。
+static NSMutableDictionary *ndSwBright = nil;        // uuid -> NSNumber(软件亮度 0~100)
+static NSMutableDictionary *ndOverlayWindows = nil;  // uuid -> NSWindow(遮罩窗口)
+static NSMutableDictionary *ndOverlayViews = nil;    // uuid -> NSView(黑色内容视图)
+
+static void ndOverlayInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ndSwBright = [NSMutableDictionary dictionary];
+        ndOverlayWindows = [NSMutableDictionary dictionary];
+        ndOverlayViews = [NSMutableDictionary dictionary];
+    });
+}
+static NSString *ndUUIDForDisplay(CGDirectDisplayID did) {
+    CFUUIDRef u = CGDisplayCreateUUIDFromDisplayID(did);
+    if (!u) return nil;
+    CFStringRef s = CFUUIDCreateString(kCFAllocatorDefault, u);
+    CFRelease(u);
+    if (!s) return nil;
+    return (__bridge_transfer NSString *)s;
+}
+static NSScreen *ndScreenForDisplay(CGDirectDisplayID did) {
+    for (NSScreen *s in [NSScreen screens]) {
+        NSNumber *n = s.deviceDescription[@"NSScreenNumber"];
+        if (n && (int)n.unsignedIntValue == (int)did) return s;
+    }
+    return nil;
+}
+
+// 确保某块屏的遮罩窗口已存在（没有就建）。必须在主线程调用。
+static BOOL ndEnsureOverlay(NSString *uuid, NSScreen *screen) {
+    ndOverlayInit();
+    if (!uuid.length || !screen) return NO;
+    if (ndOverlayWindows[uuid]) return YES;
+
+    // 覆盖整块屏幕的置顶层窗口。
+    // ⚠️⚠️ 两个坑都踩过，缺一不可：
+    //  1) 背景色必须显式设成 clearColor。NSWindow 默认背景是**不透明的** windowBackgroundColor，
+    //     一旦漏设，这个全屏窗口一显示就把整块屏盖成一块不透明灰/黑 → 用户看到"一调就黑屏"。
+    //  2) 必须带**黑色内容视图**。用 opaque=NO + clearColor 的"空窗口"时，AppKit 判定它无内容
+    //     直接不合成，怎么改 alpha 屏幕都没反应（用户看到"调了没效果"）。
+    // 正确组合：窗口 clearColor + contentView 是黑色视图，用后者的 opacity 控制压暗程度。
+    NSRect f = screen.frame;
+    NSWindow *w = [[NSWindow alloc] initWithContentRect:f
+                                              styleMask:NSWindowStyleMaskBorderless
+                                                backing:NSBackingStoreBuffered
+                                                  defer:NO];
+    w.level = NSStatusWindowLevel;      // 高于普通窗口，菜单栏也会被盖上（调暗就该如此）
+    w.opaque = NO;
+    w.backgroundColor = [NSColor clearColor];   // ← 关键：不设就会把整屏盖成不透明色
+    w.hasShadow = NO;
+    w.ignoresMouseEvents = YES;         // 不挡鼠标
+    w.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces
+                         | NSWindowCollectionBehaviorStationary
+                         | NSWindowCollectionBehaviorIgnoresCycle
+                         | NSWindowCollectionBehaviorFullScreenAuxiliary;
+    w.releasedWhenClosed = NO;
+    w.alphaValue = 1.0;                 // 窗口自身全不透明，由内容视图的不透明度控制压暗强度
+
+    // 真正的调暗载体：一块纯黑视图，用其 opacity 表示"压暗多少"
+    NSView *black = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, f.size.width, f.size.height)];
+    black.wantsLayer = YES;
+    black.layer.backgroundColor = [NSColor blackColor].CGColor;
+    black.layer.opacity = 0.0;          // 初始不压暗
+    black.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    w.contentView = black;
+    [w orderFrontRegardless];
+
+    ndOverlayWindows[uuid] = w;
+    ndOverlayViews[uuid] = black;
+    return YES;
+}
+
+// 设置软件"亮度"：bright 0~100（100 = 不压暗 = 最亮）
+// ⚠️ 存的是**亮度**、遮罩要的是**黑度**，两者反向：黑度 = (1 - 亮度/100)^0.7 × 0.9。
+// 曾把"亮度值"直接当黑度用（亮度 90 → 盖 90% 黑）→ 一按亮度键屏幕全黑。
+// 上限 0.9：即使亮度调到 0 也留一点可见度，避免用户把自己"调瞎"没法恢复。
+// 曲线 pow(0.7) 而非线性：HDR 屏硬件亮度锁死 100，软件遮罩是唯一手段，
+// 线性时头几次按键的黑度只有 1~2%，肉眼看不出（会被当成"调了没反应"）。
+static void ndSetSoftwareBrightness(CGDirectDisplayID did, int bright) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ ndSetSoftwareBrightness(did, bright); });
+        return;
+    }
+    if (bright < 0) bright = 0;
+    if (bright > 100) bright = 100;
+    NSString *uuid = ndUUIDForDisplay(did);
+    if (!uuid.length) return;
+    NSScreen *screen = ndScreenForDisplay(did);
+    if (!ndEnsureOverlay(uuid, screen)) return;
+
+    ndSwBright[uuid] = @(bright);
+    double dim = ND_SW_DIM_MAX * pow(1.0 - bright / 100.0, 0.7);
+    NDLog(@"[hdr] display %d 软件亮度=%d%% → 黑度=%.1f%%", did, bright, dim * 100);
+    NSWindow *w = ndOverlayWindows[uuid];
+    [w setFrame:screen.frame display:YES];
+    NSView *v = ndOverlayViews[uuid];
+    v.layer.opacity = (float)dim;      // 强度作用在内容视图（窗口自身保持背景全透明）
+    [v setNeedsDisplay:YES];
+}
+
+// 读回软件"亮度" 0~100；从未设置过返回 100（= 硬件最亮，没压暗）
+static int ndGetSoftwareBrightness(CGDirectDisplayID did) {
+    ndOverlayInit();
+    NSString *uuid = ndUUIDForDisplay(did);
+    if (!uuid.length) return 100;
+    NSNumber *v = ndSwBright[uuid];
+    if (!v) return 100;
+    return (int)lround(v.doubleValue);
+}
+
+// 该屏当前是否挂着软件调暗层
+static BOOL ndHasSoftwareDim(CGDirectDisplayID did) {
+    ndOverlayInit();
+    NSString *uuid = ndUUIDForDisplay(did);
+    return uuid.length && ndSwBright[uuid] != nil;
+}
+
+// 移除某块屏的软件调暗层（关掉 HDR 后调用，恢复纯 DDC 控制）
+static void ndClearSoftwareDim(CGDirectDisplayID did) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ ndClearSoftwareDim(did); });
+        return;
+    }
+    ndOverlayInit();
+    NSString *uuid = ndUUIDForDisplay(did);
+    if (!uuid.length) return;
+    NSView *v = ndOverlayViews[uuid];
+    if (v) v.layer.opacity = 0;        // 先把黑视图调全透明，再撤窗
+    NSWindow *w = ndOverlayWindows[uuid];
+    if (w) [w orderOut:nil];
+    [ndSwBright removeObjectForKey:uuid];
+    [ndOverlayWindows removeObjectForKey:uuid];
+    [ndOverlayViews removeObjectForKey:uuid];
+}
+
+// 对账：显示器热插拔 / ID 变化后，把已不存在屏幕的遮罩窗口收掉，
+// 避免残留窗口一直压暗屏幕而用户又调不动（"黑屏 + 滑条乱跳"的成因之一）。
+static void ndReconcileOverlays(NSArray<NSString *> *liveUUIDs) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ ndReconcileOverlays(liveUUIDs); });
+        return;
+    }
+    ndOverlayInit();
+    NSMutableArray *dead = [NSMutableArray array];
+    for (NSString *uuid in ndOverlayWindows.allKeys)
+        if (![liveUUIDs containsObject:uuid]) [dead addObject:uuid];
+    for (NSString *uuid in dead) {
+        NSView *v = ndOverlayViews[uuid];
+        if (v) v.layer.opacity = 0;
+        NSWindow *w = ndOverlayWindows[uuid];
+        if (w) [w orderOut:nil];
+        [ndSwBright removeObjectForKey:uuid];
+        [ndOverlayWindows removeObjectForKey:uuid];
+        [ndOverlayViews removeObjectForKey:uuid];
+        NDLog(@"[hdr] 对账：收掉已消失显示器的遮罩 %@", uuid);
+    }
+}
+
+// ============================ HDR（高动态范围）开关 ============================
+// macOS 系统设置里的"高动态范围"开关由 CoreDisplay 私有接口承载：
+//   CoreDisplay_Display_SupportsHDRMode(id)      能力查询 → 决定菜单里是否显示该项
+//   CoreDisplay_Display_IsHDRModeEnabled(id)     当前是否开启
+//   CoreDisplay_Display_SetHDRModeEnabled(id,on) 开关
+// 实测：QSN-CBB 支持=1、AOC 支持=0；开关后 EDR 值在 1.0 / 1.2 之间变化，可作效果判据。
+typedef Boolean (*NdHdrSupportsFn)(CGDirectDisplayID);
+typedef Boolean (*NdHdrEnabledFn)(CGDirectDisplayID);
+typedef void    (*NdHdrSetFn)(CGDirectDisplayID, Boolean);
+static NdHdrSupportsFn ndHdrSupportsFn = NULL;
+static NdHdrEnabledFn  ndHdrEnabledFn  = NULL;
+static NdHdrSetFn      ndHdrSetFn      = NULL;
+
+static void ndHDRLoad(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *cd = dlopen("/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay", RTLD_LAZY);
+        if (!cd) return;
+        ndHdrSupportsFn = (NdHdrSupportsFn)dlsym(cd, "CoreDisplay_Display_SupportsHDRMode");
+        ndHdrEnabledFn  = (NdHdrEnabledFn)dlsym(cd, "CoreDisplay_Display_IsHDRModeEnabled");
+        ndHdrSetFn      = (NdHdrSetFn)dlsym(cd, "CoreDisplay_Display_SetHDRModeEnabled");
+    });
+}
+static BOOL ndHDRSupported(CGDirectDisplayID did) {
+    ndHDRLoad();
+    return ndHdrSupportsFn ? (BOOL)ndHdrSupportsFn(did) : NO;
+}
+static BOOL ndHDREnabled(CGDirectDisplayID did) {
+    ndHDRLoad();
+    return ndHdrEnabledFn ? (BOOL)ndHdrEnabledFn(did) : NO;
+}
+// 写入后**必须回读复核**：这个开关在部分第三方屏上会自己弹回去（用户就遇到过），
+// 不复核的话菜单会显示成一个假状态。
+static BOOL ndSetHDREnabled(CGDirectDisplayID did, BOOL on) {
+    ndHDRLoad();
+    if (!ndHdrSetFn) return NO;
+    ndHdrSetFn(did, on ? 1 : 0);
+    usleep(900000);
+    return ndHDREnabled(did) == on;
+}
+
+// ============================ 声音输出设备（CoreAudio） ============================
+// 【关键坑】蓝牙耳机在 CoreAudio 里是**两个同名设备**，靠 UID 区分：
+//   「Misiom-Scorpio」UID=...:input  → 麦克风端点，出流=0
+//   「Misiom-Scorpio」UID=...:output → 扬声器端点，出流=1 ← 这才是要的
+// 按名字取"第一个匹配"会选中 input 端点，AudioObjectSetPropertyData 照样返回 noErr，
+// 但读回默认设备根本没变 → 表现为"切到蓝牙没反应/没声音"。所以一律用 UID 定位。
+// 另外 AudioDeviceID 在蓝牙重连后会变（实测 108 → 114），UID 才是稳定标识。
+
+// 取设备的稳定 UID（取不到返回 nil）
+static NSString *ndDeviceUID(AudioDeviceID d) {
+    CFStringRef uid = NULL;
+    UInt32 us = sizeof uid;
+    AudioObjectPropertyAddress ua = {
+        kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectGetPropertyData(d, &ua, 0, NULL, &us, &uid) != noErr || !uid) return nil;
+    return (__bridge_transfer NSString *)uid;
+}
+static NSString *ndDeviceName(AudioDeviceID d) {
+    CFStringRef nm = NULL;
+    UInt32 nsz = sizeof nm;
+    AudioObjectPropertyAddress na = {
+        kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectGetPropertyData(d, &na, 0, NULL, &nsz, &nm) != noErr || !nm) return nil;
+    return (__bridge_transfer NSString *)nm;
+}
+static int ndOutStreams(AudioDeviceID d) {
+    AudioObjectPropertyAddress sc = {
+        kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain
+    };
+    UInt32 ss = 0;
+    if (AudioObjectGetPropertyDataSize(d, &sc, 0, NULL, &ss) != noErr || ss == 0) return 0;
+    AudioBufferList *bl = calloc(1, ss);
+    int n = 0;
+    if (AudioObjectGetPropertyData(d, &sc, 0, NULL, &ss, bl) == noErr) n = bl->mNumberBuffers;
+    free(bl);
+    return n;
+}
+static BOOL ndDeviceAlive(AudioDeviceID d) {
+    UInt32 a = 0, as = sizeof a;
+    AudioObjectPropertyAddress aa = {
+        kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    return AudioObjectGetPropertyData(d, &aa, 0, NULL, &as, &a) == noErr && a;
+}
+
+// 枚举"可用的输出设备"：返回 UID 数组（顺序稳定：显示器 → 耳机 → 音箱 → 内建，按 UID 字典序）
+static NSArray<NSString *> *ndAudioOutputUIDs(void) {
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size) != noErr) return @[];
+    UInt32 n = size / sizeof(AudioDeviceID);
+    if (!n) return @[];
+    AudioDeviceID *devs = calloc(n, sizeof(AudioDeviceID));
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, devs) != noErr) {
+        free(devs); return @[];
+    }
+    NSMutableArray *uids = [NSMutableArray array];
+    for (UInt32 i = 0; i < n; i++) {
+        if (ndOutStreams(devs[i]) <= 0) continue;      // 必须真有输出流（挡掉 :input 端点）
+        if (!ndDeviceAlive(devs[i])) continue;          // 离线设备不列
+        NSString *u = ndDeviceUID(devs[i]);
+        if (u.length) [uids addObject:u];
+    }
+    free(devs);
+    [uids sortUsingSelector:@selector(compare:)];
+    return uids;
+}
+
+// 按 UID 找显示名（菜单展示用）
+static NSString *ndNameForUID(NSString *uid) {
+    if (!uid.length) return nil;
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size) != noErr) return nil;
+    UInt32 n = size / sizeof(AudioDeviceID);
+    AudioDeviceID *devs = calloc(n, sizeof(AudioDeviceID));
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, devs) != noErr) {
+        free(devs); return nil;
+    }
+    NSString *ret = nil;
+    for (UInt32 i = 0; i < n && !ret; i++) {
+        NSString *u = ndDeviceUID(devs[i]);
+        if ([u isEqualToString:uid] && ndOutStreams(devs[i]) > 0) ret = ndDeviceName(devs[i]);
+    }
+    free(devs);
+    return ret;
+}
+
+// 当前默认输出设备的 UID（比较菜单勾选状态用）
+static NSString *ndCurrentOutputUID(void) {
+    AudioObjectPropertyAddress da = {
+        kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    AudioDeviceID dev = kAudioObjectUnknown;
+    UInt32 cs = sizeof dev;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &da, 0, NULL, &cs, &dev) != noErr) return nil;
+    if (dev == kAudioObjectUnknown) return nil;
+    return ndDeviceUID(dev);
+}
+
+// 按 UID 切换默认输出设备。成功返回 YES。
+static BOOL ndSetDefaultOutputByUID(NSString *wantUID) {
+    if (!wantUID.length) return NO;
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size) != noErr) return NO;
+    UInt32 n = size / sizeof(AudioDeviceID);
+    AudioDeviceID *devs = calloc(n, sizeof(AudioDeviceID));
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, devs) != noErr) {
+        free(devs); return NO;
+    }
+    AudioDeviceID target = kAudioObjectUnknown;
+    for (UInt32 i = 0; i < n; i++) {
+        NSString *u = ndDeviceUID(devs[i]);
+        if ([u isEqualToString:wantUID] && ndOutStreams(devs[i]) > 0) { target = devs[i]; break; }
+    }
+    free(devs);
+    if (target == kAudioObjectUnknown) return NO;
+
+    // 蓝牙耳机常是 44100、系统其他设备是 48000：切过去之前先把采样率对齐，
+    // 否则音频流起不来（表现为切过去"没声音"）。
+    Float64 cur = 0; UInt32 cs2 = sizeof cur;
+    AudioObjectPropertyAddress sra = {
+        kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectGetPropertyData(target, &sra, 0, NULL, &cs2, &cur) == noErr && cur > 0 && cur < 48000) {
+        Float64 want2 = 48000; UInt32 ts = sizeof want2;
+        AudioObjectSetPropertyData(target, &sra, 0, NULL, ts, &want2);
+    }
+
+    AudioObjectPropertyAddress da = {
+        kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectSetPropertyData(kAudioObjectSystemObject, &da, 0, NULL, sizeof target, &target) != noErr) return NO;
+
+    // 复核：读回默认设备，确认真的切过去了（这一步能挡住"rc=0 但没生效"的假成功）
+    usleep(400000);
+    AudioDeviceID now = kAudioObjectUnknown; UInt32 ns = sizeof now;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &da, 0, NULL, &ns, &now) != noErr) return NO;
+    return now == target;
+}
+
+// 当前默认输出设备名（复用上面已有实现）
 static NSString *DefaultOutputDeviceName(void) {
     AudioObjectPropertyAddress addr = {
         kAudioHardwarePropertyDefaultOutputDevice,
@@ -381,8 +771,9 @@ static NSArray *FetchDisabledIDs(void) {
     NSMutableArray *a = [NSMutableArray array];
     for (NSString *raw in [RunCLI(@[@"disabled"]) componentsSeparatedByString:@"\n"]) {
         NSString *l = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        // 每行格式: disabled <uuid>[<TAB>显示器名]
-        if ([l hasPrefix:@"disabled "]) [a addObject:[l substringFromIndex:9]];
+        // 每行格式: disabled <uuid>[<TAB>显示器名]  |  软熄屏(27+): softoff <uuid>[<TAB>显示器名]
+        if ([l hasPrefix:@"disabled "]) [a addObject:[[l substringFromIndex:9] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]];
+        else if ([l hasPrefix:@"softoff "]) [a addObject:[[l substringFromIndex:8] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]];   // 注意 "softoff " 是 8 字符，少裁一位会带前导空格导致 uuid 匹配不上
     }
     return a;
 }
@@ -545,7 +936,15 @@ static BOOL ndDefaultOutputIsDisplay(void);
         return YES;
     }
     float cur = ndSystemVolume();
-    if (cur < 0) { NDLog(@"[vol] 读取系统音量失败"); return YES; }
+    if (cur < 0) {
+        // 读不到 CoreAudio 音量 = 当前设备不暴露音量属性（蓝牙耳机就是这种情况：
+        // A2DP 设备走 AVRCP 绝对音量，CoreAudio 上没有 VolumeScalar / VirtualMasterVolume）。
+        // 这种设备没法用软件直写，如实告诉用户，别假装调动了。
+        NDLog(@"[vol] 当前输出设备无 CoreAudio 音量属性（多为蓝牙耳机）→ 音量键不生效");
+        [self alert:@"该设备不支持音量调节" text:
+                @"蓝牙耳机的音量由耳机自身和 AVRCP 控制，macOS 不把它暴露给软件。\n\n音量键对蓝牙耳机无效，请用耳机上的按键或「系统设置 → 声音」调节。"];
+        return YES;
+    }
     int stepPct = [gConf[@"stepVolume"] intValue]; if (stepPct <= 0) stepPct = 2;
     float step = stepPct / 100.0f;
     float tgt = MIN(MAX(cur + (act == ActVolUp ? step : -step), 0.0f), 1.0f);
@@ -943,6 +1342,12 @@ static NSEvent *FakeMediaKey(int keyCode, BOOL isDown) {
         for (DlDisp *x in d)
             self.dispNameCache[[NSString stringWithFormat:@"%d", x.did]] = [x displayName];
         [self rememberDisplayNames:d];
+        // 遮罩对账：把已经不存在的显示器的遮罩窗口收掉（ID 漂移/拔线后避免残留窗口一直压暗屏幕）
+        {
+            NSMutableArray *liveUUIDs = [NSMutableArray array];
+            for (DlDisp *x in d) if (x.uuid.length) [liveUUIDs addObject:x.uuid];
+            ndReconcileOverlays(liveUUIDs);
+        }
         [self updateStatusLabel];
         [self syncOpenMenuSliders];
     });
@@ -1065,6 +1470,12 @@ static NSEvent *FakeMediaKey(int keyCode, BOOL isDown) {
 // 当前"真值"：以 App 侧目标值为准（显示器回读既滞后又可能失败，不能当基准）
 // 返回 -1 表示完全没有可信基准 —— 调用方应跳过本次调节，绝不能拿 0 去加减
 - (int)currentLevelForDisp:(DlDisp *)d vcp:(int)vcp max:(int *)outMax {
+    // HDR 屏：亮度基准取"软件亮度"（DDC 回读在 HDR 下恒为 100，不能用）
+    if (vcp == 0x10 && DisplayIsEDR(d.did)) {
+        if (outMax) *outMax = 100;
+        // 挂过软件调暗层 → 用它记录的值；没挂过 = 硬件最亮 = 100
+        return ndGetSoftwareBrightness(d.did);
+    }
     int mon = (vcp == 0x10) ? d.bright : d.vol;
     BOOL monKnown = (vcp == 0x10) ? d.brightKnown : d.volKnown;
     int mx  = (vcp == 0x10) ? d.bmax   : d.vmax;
@@ -1098,6 +1509,20 @@ static NSEvent *FakeMediaKey(int keyCode, BOOL isDown) {
 
 // 绝对写入（自动合并连发产生的中间值）
 - (void)writeLevel:(int)value did:(int)did vcp:(int)vcp {
+    // HDR 屏：DDC 亮度被显示器丢弃 → 改走软件调暗（叠加层）
+    if (vcp == 0x10 && DisplayIsEDR(did)) {
+        int bright = MIN(MAX(value, 0), 100);
+        ndSetSoftwareBrightness(did, bright);
+        NDLog(@"[hdr] display %d 软件亮度 → %d%%（DDC 被 HDR 屏蔽，改写叠加层）", did, bright);
+        [self noteLevel:bright did:did vcp:vcp];
+        [self refreshAsync];
+        return;
+    }
+    // 之前挂过软件调暗层、现在关掉了 HDR → 清掉叠加层，回到 DDC 真亮度
+    if (vcp == 0x10 && ndHasSoftwareDim(did) && !DisplayIsEDR(did)) {
+        ndClearSoftwareDim(did);
+        NDLog(@"[hdr] display %d HDR 已关 → 清除软件调暗层，回到 DDC", did);
+    }
     NSString *key = [self ddcKey:did vcp:vcp];
     BOOL busy = NO;
     @synchronized (self) {
@@ -1267,7 +1692,20 @@ static const CGFloat kOSD_H = 44;
             if (p.count != 2) continue;
             DlDisp *d = [self dispByID:[p[0] intValue]];
             if (!d) continue;
-            int val = ([p[1] intValue] == 0x10) ? d.bright : d.vol;
+            int vcp = [p[1] intValue];
+            int val;
+            // ⚠️ 必须与 sliderItem: 用同一套取值逻辑，否则菜单开着时滑条会来回跳：
+            // 亮度在 HDR 屏要走"软件亮度"（DDC 在 HDR 下恒为 100，拿它同步会把滑条拽回 100）。
+            if (vcp == 0x10 && DisplayIsEDR(d.did)) {
+                val = ndGetSoftwareBrightness(d.did);
+            } else if (vcp == 0x10) {
+                if (!d.brightKnown) continue;      // 回读失败 → 不拿无效值去改滑条
+                val = d.bright;
+            } else {
+                if (!d.volKnown) continue;
+                val = d.vol;
+            }
+            if (val < 0) continue;
             sl.doubleValue = val;
             for (NSView *s2 in it.view.subviews)
                 if (s2.tag == 99 && [s2 isKindOfClass:[NSTextField class]])
@@ -1338,6 +1776,8 @@ static const CGFloat kOSD_H = 44;
 
         int b0 = md ? ReadDDCValue(md.did, 0x10) : -1;
         int w0 = vd ? ReadDDCValue(vd.did, 0x62) : -1;
+        NSString *mdName = md ? [md displayName] : @"未知屏";
+        int savedBrightDim = -1;    // 测试前该屏的软件调暗值（HDR 屏），结束要原样恢复
         printf("  测试前: 亮度=%d  音量=%d\n", b0, w0);
 
         NSArray *cases = @[
@@ -1350,12 +1790,22 @@ static const CGFloat kOSD_H = 44;
             int code = [c[0] intValue];
             int vcp = [c[2] intValue];
             int did = [c[3] intValue];
-            int before = ReadDDCValue(did, vcp);
+            // HDR 屏亮度走软件调暗（DDC 恒为 100），自检必须读软件亮度值，否则一律误报"无变化"
+            BOOL hdrBright = (vcp == 0x10 && did > 0 && DisplayIsEDR(did));
+            // 记录测试前的软件亮度：自检结束要原样恢复，不能破坏用户平时的观感
+            // （-1 = 测试前没挂过调暗层，收尾时应清除而不是写某个值）
+            int savedDim = (hdrBright && ndHasSoftwareDim(did)) ? ndGetSoftwareBrightness(did) : -1;
+            if (hdrBright && savedDim >= 0 && savedBrightDim < 0) savedBrightDim = savedDim;
+            // HDR 屏先落到 60 这个确定中间值再测：100 是顶格（+2 看不出）、
+            // 且只有让 before 反映真实状态，报告的数值才诚实
+            if (hdrBright) { ndSetSoftwareBrightness(did, 60); pumpRunLoop(0.2); }
+            int before = hdrBright ? ndGetSoftwareBrightness(did) : ReadDDCValue(did, vcp);
             [self handleSystemDefined:FakeMediaKey(code, YES)];
             pumpRunLoop(1.4);                       // 跑主循环，让异步回调有机会执行
-            int after = ReadDDCValue(did, vcp);
-            printf("  %s 键: %d → %d   %s\n", [c[1] UTF8String], before, after,
-                   after != before ? "✓ 已响应" : "✗ 无变化");
+            int after = hdrBright ? ndGetSoftwareBrightness(did) : ReadDDCValue(did, vcp);
+            printf("  %s 键: %d → %d   %s%s\n", [c[1] UTF8String], before, after,
+                   after != before ? "✓ 已响应" : "✗ 无变化",
+                   hdrBright ? "（HDR·软件调暗）" : "");
         }
         // 静音键两次（应回到原音量）
         int v1 = -1, v2 = -1;
@@ -1371,9 +1821,20 @@ static const CGFloat kOSD_H = 44;
 
         // 收尾还原：写回测试前的值，确保自检零副作用
         if (md && b0 >= 0) {
-            RunCLI(@[@"ddc", @"set", [NSString stringWithFormat:@"%d", md.did], @"0x10",
-                     [NSString stringWithFormat:@"%d", b0]]);
-            printf("  已还原亮度到 %d（现值 %d）\n", b0, ReadDDCValue(md.did, 0x10));
+            if (DisplayIsEDR(md.did)) {
+                // HDR 屏：原样恢复测试前的软件亮度（而不是一律清零，
+                // 否则会把用户平时"开着 HDR 且已调暗"的观感改掉）
+                if (savedBrightDim >= 0) ndSetSoftwareBrightness(md.did, savedBrightDim);
+                else ndClearSoftwareDim(md.did);
+                printf("  已还原 %s 的软件亮度 → %s\n", mdName.UTF8String,
+                       (savedBrightDim >= 0 && savedBrightDim < 100)
+                           ? [NSString stringWithFormat:@"%d%%", savedBrightDim].UTF8String
+                           : "最亮（无压暗）");
+            } else {
+                RunCLI(@[@"ddc", @"set", [NSString stringWithFormat:@"%d", md.did], @"0x10",
+                         [NSString stringWithFormat:@"%d", b0]]);
+                printf("  已还原亮度到 %d（现值 %d）\n", b0, ReadDDCValue(md.did, 0x10));
+            }
         }
         if (vd && w0 >= 0) {
             RunCLI(@[@"ddc", @"set", [NSString stringWithFormat:@"%d", vd.did], @"0x62",
@@ -1395,6 +1856,33 @@ static const CGFloat kOSD_H = 44;
         }
         fflush(stdout);
         exit(0);
+    }
+
+    // HDR 开关自测：NiceDisplay --hdrtest on|off|toggle  （不传参数则只报告状态）
+    if ([[NSProcessInfo processInfo].arguments containsObject:@"--hdrtest"]) {
+        NSArray *a = [NSProcessInfo processInfo].arguments;
+        NSString *act = @"";
+        NSUInteger idx = [a indexOfObject:@"--hdrtest"];
+        if (idx != NSNotFound && idx + 1 < a.count) act = a[idx + 1];
+        printf("=== HDR 能力与状态 ===\n");
+        CGDirectDisplayID hdrDid = 0;
+        self.displays = FetchDisplays();
+        for (DlDisp *dd in self.displays) {
+            BOOL sup = ndHDRSupported(dd.did), en = ndHDREnabled(dd.did);
+            printf("  %-14s id=%-3d 支持HDR=%d 已开启=%d%s\n",
+                   [dd displayName].UTF8String, dd.did, (int)sup, (int)en,
+                   sup ? "" : "   (菜单里不显示 HDR 项)");
+            if (sup) hdrDid = dd.did;
+        }
+        if (!hdrDid) { printf("没有支持 HDR 的显示器\n"); exit(0); }
+        if (!act.length) exit(0);
+        BOOL want = [act isEqualToString:@"on"] ? YES
+                  : [act isEqualToString:@"off"] ? NO : !ndHDREnabled(hdrDid);
+        printf("执行 %s → %s ...\n", act.UTF8String, want ? "开启" : "关闭");
+        BOOL ok = ndSetHDREnabled(hdrDid, want);
+        printf("  结果: 已开启=%d  %s\n", (int)ndHDREnabled(hdrDid), ok ? "✓ 已生效" : "✗ 未生效（被弹回）");
+        if (ok && !want) ndClearSoftwareDim(hdrDid);
+        exit(ok ? 0 : 1);
     }
 
     // 自检模式：把"点开菜单"和"注册热键"这两条平时难以验证的路径提前跑一遍
@@ -1433,6 +1921,30 @@ static const CGFloat kOSD_H = 44;
                                col ? [[col description] UTF8String] : "-");
                     }
                 }
+            }
+        }
+        // 【回归】HDR 滑条同步：菜单开着时每 6 秒会跑一次 syncOpenMenuSliders，
+        // 它必须用"软件亮度"而不是 DDC 值（DDC 在 HDR 下恒为 100），否则滑条会被拽回 100 = 用户看到的"乱跳"。
+        {
+            for (DlDisp *dd in self.displays) {
+                if (!DisplayIsEDR(dd.did)) continue;
+                ndSetSoftwareBrightness(dd.did, 60);
+                BOOL oldOpen = self.menuIsOpen;
+                self.menuIsOpen = YES;
+                [self syncOpenMenuSliders];
+                self.menuIsOpen = oldOpen;
+                for (NSMenuItem *it2 in m.itemArray) {
+                    for (NSView *sv in it2.view.subviews) {
+                        if (![sv isKindOfClass:[NSSlider class]]) continue;
+                        NSSlider *sl = (NSSlider *)sv;
+                        NSArray *p = [sl.identifier componentsSeparatedByString:@":"];
+                        if (p.count != 2 || [p[0] intValue] != dd.did || [p[1] intValue] != 0x10) continue;
+                        printf("  HDR 滑条同步回归: %.0f%%（期望 60，若是 100 说明又被 DDC 值拽回去了）\n",
+                               sl.doubleValue);
+                    }
+                }
+                ndClearSoftwareDim(dd.did);
+                break;
             }
         }
         printf("已注册全局热键=%lu / 配置项=%lu\n",
@@ -1621,7 +2133,8 @@ static const CGFloat kOSD_H = 44;
                     NDLog(@"[perf] 显示器 DDC 音量不可用 → 退回系统音量 %d%%→%d%%", (int)(sc*100+0.5), (int)(st*100+0.5));
                     return;
                 }
-                NDLog(@"[perf] 音量无基准值且系统音量读不到，跳过本次");
+                NDLog(@"[perf] 音量无基准值且系统音量读不到，跳过本次"
+                      @"（当前输出设备可能是不暴露音量的蓝牙耳机）");
                 [self refreshAsync];
                 return;
             }
@@ -1659,7 +2172,7 @@ static const CGFloat kOSD_H = 44;
 #pragma mark - 菜单
 
 // 版本号（与 Info.plist 的 CFBundleShortVersionString 保持一致）
-#define APP_VERSION   @"1.3.2"
+#define APP_VERSION   @"1.4.0"
 #define APP_AUTHOR    @"@yangc8899"
 
 - (void)menuWillOpen:(NSMenu *)menu { self.menuIsOpen = YES; }
@@ -1707,9 +2220,10 @@ static const CGFloat kOSD_H = 44;
         [menu addItem:it];
     }
     for (DlDisp *d in self.displays) {
-        // 已关闭（断开）的屏不在"活动"区渲染：只保留下面 disabledIDs 段的一行标题+开关
+        // 已关闭（断开）或已安全熄屏(27+)的屏不在"活动"区渲染：只保留下面 disabledIDs 段的一行标题+开关
         // —— 用户要求"关闭后配置收起，重新打开才展开"
         if (!d.isActive) continue;
+        if ([self.disabledIDs containsObject:d.uuid]) continue;   // 软熄屏/真·断开统一在下方段显示，避免重复
         {
             NSString *sm = [d summary];
             if (d.isMain) sm = [sm stringByAppendingString:@" · 主屏"];
@@ -1737,6 +2251,19 @@ static const CGFloat kOSD_H = 44;
         }
 
         // —— 常驻于每块显示器下的控制项 ——
+        // "高动态范围 (HDR)"：**只对该屏支持 HDR 时显示**（不支持的屏不展示这一项）
+        if (ndHDRSupported(d.did)) {
+            BOOL hdrOn = ndHDREnabled(d.did);
+            NSMenuItem *hdrIt = [[NSMenuItem alloc] initWithTitle:@"高动态范围 (HDR)"
+                                                          action:@selector(onToggleHDR:)
+                                                   keyEquivalent:@""];
+            hdrIt.target = self;
+            hdrIt.representedObject = @(d.did);
+            hdrIt.state = hdrOn ? NSControlStateValueOn : NSControlStateValueOff;
+            hdrIt.image = [self symImage:@"sparkles"];
+            [menu addItem:hdrIt];
+        }
+
         // "设为主屏幕"：所有屏都显示；主屏打勾置灰（已是主屏），副屏可点
         NSMenuItem *mi = [[NSMenuItem alloc] initWithTitle:@"设为主屏幕" action:@selector(onSetMain:) keyEquivalent:@""];
         mi.image = [self symImage:@"star"];
@@ -1753,12 +2280,46 @@ static const CGFloat kOSD_H = 44;
     for (NSString *sid in self.disabledIDs) {
         NSString *nm = self.dispNameByUUID[sid] ?: self.dispNameCache[sid]
                        ?: [NSString stringWithFormat:@"显示器 %.8s", sid.UTF8String];
-        [menu addItem:[self headerSwitchItemForID:sid name:nm summary:@"已关闭（拨动右侧开关可连回）" active:NO]];
+        [menu addItem:[self headerSwitchItemForID:sid name:nm summary:@"已关闭（拨动右侧开关可点亮）" active:NO]];
         [menu addItem:[NSMenuItem separatorItem]];
     }
 
     // 布局快照 / 应急恢复 已挪到设置窗口"高级"页，主菜单不再显示
     // （"快捷键一览" 已按用户要求移除——2026-09-14；键位说明见设置窗口）
+
+    // 声音输出方式（CoreAudio）：列出所有输出设备，当前默认打勾，点击即切换
+    // 一律用 UID 定位设备（蓝牙耳机有同名 input/output 两个端点，且 ID 重连后会变）
+    {
+        NSString *curUID = ndCurrentOutputUID();
+        NSArray<NSString *> *uids = ndAudioOutputUIDs();
+        NSMenu *sub = [[NSMenu alloc] init];
+        sub.autoenablesItems = NO;
+        if (!uids.count) {
+            NSMenuItem *none = [self plainItem:@"（未检测到输出设备）" action:nil];
+            none.enabled = NO;
+            [sub addItem:none];
+        } else {
+            for (NSString *u in uids) {
+                NSString *name = ndNameForUID(u) ?: u;
+                BOOL isCur = (curUID && [u isEqualToString:curUID]);
+                NSMenuItem *mi = [[NSMenuItem alloc] initWithTitle:name
+                                                          action:@selector(onPickAudioOutput:)
+                                                   keyEquivalent:@""];
+                mi.target = self;
+                mi.representedObject = u;          // 存 UID，不存名字
+                // 当前设备打勾即可，**不要置灰**（置灰很难看，用户明确要求）
+                mi.state = isCur ? NSControlStateValueOn : NSControlStateValueOff;
+                mi.enabled = YES;
+                mi.indentationLevel = 0;
+                [sub addItem:mi];
+            }
+        }
+        NSMenuItem *snd = [[NSMenuItem alloc] initWithTitle:@"声音输出方式" action:nil keyEquivalent:@""];
+        snd.submenu = sub;
+        snd.image = [self symImage:@"speaker.wave.2"];
+        [menu addItem:snd];
+        [menu addItem:[NSMenuItem separatorItem]];
+    }
 
     NSMenuItem *setIt = [self plainItem:@"设置…" action:@selector(onOpenSettings:)];
     setIt.image = [self symImage:@"gearshape"];
@@ -1959,11 +2520,30 @@ static const CGFloat kOSD_H = 44;
     RunCLIAsync(@[wantOn ? @"enable" : @"disable", did], ^(NSString *o) {
         if ([o rangeOfString:@"拒绝"].location != NSNotFound)
             [self alert:@"不能断开最后一块显示器" text:@"系统要求至少保留一块活动显示器，操作已取消。"];
+        else if (wantOn && [o rangeOfString:@"电源键"].location != NSNotFound)
+            [self alert:@"该显示器处于硬待机" text:@"链路已断，软件无法点亮：请按一下显示器电源键。"];
         [self refreshNow];   // 同步刷新：保证下次打开菜单就是最新状态
     });
 }
 
 - (NSMenuItem *)sliderItem:(DlDisp *)d vcp:(int)vcp title:(NSString *)title value:(int)value max:(int)mx {
+    // HDR 屏：DDC 亮度被屏蔽 → 滑块反映并控制"软件调暗"
+    BOOL hdrDim = (vcp == 0x10) && DisplayIsEDR(d.did);
+    if (hdrDim) {
+        // 显示软件亮度（没挂过调暗层就是硬件最亮 100）
+        value = ndGetSoftwareBrightness(d.did);
+        mx = 100;
+    } else {
+        // DDC 回读失败时**别拿无效值渲染**（默认 0）——菜单每次重建滑条都会跳到 0，
+        // 看起来就是"滑条乱跳"。回读不到就沿用本屏上次已知的目标值。
+        BOOL known = (vcp == 0x10) ? d.brightKnown : d.volKnown;
+        if (!known) {
+            NSNumber *t = nil;
+            @synchronized (self) { t = self.ddcTarget[[self ddcKey:d.did vcp:vcp]]; }
+            if (t) value = t.intValue;
+        }
+    }
+    NSString *dispTitle = hdrDim ? @"亮度(软件)" : title;
     NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
     NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 38)];   // 行高 32→38，加大行距
 
@@ -1975,13 +2555,15 @@ static const CGFloat kOSD_H = 44;
     if (iv.image) [box addSubview:iv];
 
     CGFloat labX = iv.image ? 34 : 14;
-    NSTextField *lab = [[NSTextField alloc] initWithFrame:NSMakeRect(labX, 8, 32, 18)];
-    lab.stringValue = title;
+    NSTextField *lab = [[NSTextField alloc] initWithFrame:NSMakeRect(labX, 8, hdrDim ? 74 : 32, 18)];
+    lab.stringValue = dispTitle;
     lab.bezeled = NO; lab.editable = NO; lab.drawsBackground = NO;
-    lab.font = [NSFont menuFontOfSize:13];
+    lab.font = [NSFont menuFontOfSize:12];
+    if (hdrDim) lab.textColor = [NSColor secondaryLabelColor];
     [box addSubview:lab];
 
-    NSSlider *sl = [[NSSlider alloc] initWithFrame:NSMakeRect(68, 8, 174, 22)];
+    CGFloat slX = hdrDim ? 110 : 68;
+    NSSlider *sl = [[NSSlider alloc] initWithFrame:NSMakeRect(slX, 8, 240 - slX, 22)];
     sl.minValue = 0;
     sl.maxValue = mx > 0 ? mx : 100;
     sl.doubleValue = value;
@@ -2082,6 +2664,18 @@ static const CGFloat kOSD_H = 44;
 }
 
 - (void)sliderWriteDid:(NSString *)did vcp:(int)vcp value:(int)v ident:(NSString *)ident {
+    // HDR 屏：DDC 亮度被显示器屏蔽 → 走软件调暗，不写硬件
+    if (vcp == 0x10 && did.intValue > 0 && DisplayIsEDR(did.intValue)) {
+        ndSetSoftwareBrightness(did.intValue, MIN(MAX(v, 0), 100));
+        NDLog(@"[hdr] display %d 滑块软件亮度 → %d%%", did.intValue, v);
+        if (self.sliderPending && [self.sliderPendingIdent isEqualToString:ident] && self.sliderPending != v) {
+            int pv = self.sliderPending; self.sliderPending = 0; self.sliderBusy = NO;
+            [self sliderWriteDid:did vcp:vcp value:pv ident:ident];
+        } else {
+            self.sliderBusy = NO;
+        }
+        return;
+    }
     RunCLIAsync(@[@"ddc", @"set", did, vcp == 0x10 ? @"0x10" : @"0x62", [NSString stringWithFormat:@"%d", v]],
                 ^(NSString *o) {
         if (self.sliderPending && [self.sliderPendingIdent isEqualToString:ident] && self.sliderPending != v) {
@@ -2334,6 +2928,46 @@ static const CGFloat kOSD_H = 44;
     t.bezeled = NO; t.editable = NO; t.drawsBackground = NO;
     t.font = bold ? [NSFont boldSystemFontOfSize:13] : [NSFont systemFontOfSize:12];
     return t;
+}
+
+- (void)onPickAudioOutput:(NSMenuItem *)it {
+    NSString *uid = it.representedObject;      // UID（稳定标识）
+    if (!uid.length) return;
+    NSString *name = ndNameForUID(uid) ?: uid;
+    [self.statusItem.menu cancelTracking];   // 先收起菜单，避免切换输出时菜单被系统抢焦点
+    if (ndSetDefaultOutputByUID(uid)) {
+        NDLog(@"[audio] 默认输出已切换 → %@ (uid=%@)", name, uid);
+        // 通知系统"输出设备变了"，让控制中心/音量 HUD 同步刷新
+        AudioObjectPropertyAddress np = {
+            kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+        };
+        AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &np, dispatch_get_main_queue(),
+                                            ^(UInt32 n, const AudioObjectPropertyAddress *a) { (void)n; (void)a; });
+        // 切换后音量目标屏可能变了（显示器 vs 耳机/音箱）→ 立刻刷新菜单
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self refreshNow]; });
+    } else {
+        NDLog(@"[audio] 切换默认输出失败: %@ (uid=%@)", name, uid);
+        [self alert:@"切换声音输出失败" text:[NSString stringWithFormat:@"无法把“%@”设为默认输出设备。\n\n该设备可能已断开，或系统拒绝切换（蓝牙耳机请先确保已连接）。", name]];
+    }
+}
+
+// 切换某块屏的高动态范围（HDR）
+- (void)onToggleHDR:(NSMenuItem *)it {
+    int did = [it.representedObject intValue];
+    BOOL want = !ndHDREnabled(did);
+    [self.statusItem.menu cancelTracking];      // 先收菜单再切（HDR 切换会重配显示器）
+    BOOL ok = ndSetHDREnabled(did, want);
+    NDLog(@"[hdr] display %d 开关高动态范围 → %d  %s", did, (int)want, ok ? "已生效" : "未生效（被弹回）");
+    if (!ok) {
+        [self alert:@"切换高动态范围失败"
+                text:@"系统没有接受这次切换 —— 部分第三方显示器在 macOS 上会自己弹回去。\n\n"
+                     @"可以试试：拔插一次 DP 线，或直接改显示器自己 OSD 菜单里的 HDR 模式。"];
+    } else if (!want) {
+        // 关掉 HDR 后：撤掉软件调暗层，亮度控制交回 DDC 硬件通路
+        ndClearSoftwareDim(did);
+    }
+    [self refreshNow];
 }
 
 - (void)onOpenSettings:(id)sender {
